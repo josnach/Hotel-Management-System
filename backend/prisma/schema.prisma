@@ -1,0 +1,1262 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────── Enums ─────────────
+enum UserRole {
+  ADMIN
+  MANAGER
+  RECEPTIONIST
+  HOUSEKEEPING
+  WAITER
+  CHEF
+  ACCOUNTANT
+  STOREKEEPER
+  MAINTENANCE
+}
+
+enum RoomStatus {
+  AVAILABLE
+  OCCUPIED
+  CLEANING
+  MAINTENANCE
+  RESERVED
+}
+
+enum StayStatus {
+  CHECKED_IN
+  CHECKED_OUT
+}
+
+enum FolioStatus {
+  ACTIVE
+  CHECKED_OUT
+  SETTLED
+}
+
+enum TxType {
+  DEBIT_PERSONAL
+  DEBIT_GROUP
+  CREDIT
+}
+
+enum DiscountType {
+  NONE
+  PERCENTAGE
+  FIXED
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  TRANSFER
+  ROOM_CHARGE
+  STAFF_CREDIT
+  CITY_LEDGER
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PREPARING
+  READY
+  SERVED
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  UNPAID
+  PAID
+  VOIDED
+}
+
+enum CustomerType {
+  WALK_IN
+  GUEST
+  GROUP
+}
+
+enum ReservationStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  CHECKED_IN
+}
+
+enum ReservationSource {
+  FRONT_DESK
+  WEBSITE
+  BOOKING_COM
+  OTHER_CHANNEL
+}
+
+enum ReservationSyncStatus {
+  NOT_REQUIRED
+  PENDING
+  SYNCED
+  FAILED
+}
+
+enum IntegrationEventStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+enum EventStatus {
+  INQUIRY
+  QUOTED
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+enum POStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  RECEIVED
+  CANCELLED
+}
+
+enum PayrollStatus {
+  DRAFT
+  APPROVED
+  PAID
+}
+
+enum MovementType {
+  OPENING
+  PURCHASE
+  SALE
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  RETURN
+  ISSUE
+  TRANSFER_IN
+  TRANSFER_OUT
+  VOID_RETURN
+  RECIPE_USE
+}
+
+enum AdjustmentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum SecurityStatus {
+  PENDING
+  VERIFIED
+  FLAGGED
+}
+
+enum ShiftName {
+  MORNING
+  AFTERNOON
+  NIGHT
+}
+
+enum MaintenanceStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+}
+
+enum MenuSection {
+  FOOD
+  DRINKS
+  PASTRIES
+}
+
+enum ChatConversationType {
+  DIRECT
+  GROUP
+}
+
+enum DeliveryChannel {
+  EMAIL
+  WHATSAPP
+  SMS
+}
+
+enum DeliveryStatus {
+  QUEUED
+  SENT
+  FAILED
+}
+
+// ───────────── Identity ─────────────
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  email        String   @unique
+  passwordHash String
+  fullName     String?
+  role         UserRole
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+    /// Two-factor authentication (TOTP). The secret is stored AES-256-GCM encrypted, never in clear text.
+  twoFactorEnabled        Boolean   @default(false)
+  twoFactorSecretEnc      String?
+  /// SHA-256 hashes of the one-time recovery codes that have not been used yet.
+  twoFactorRecoveryHashes Json?
+  /// Last accepted TOTP time-step, so the same 6-digit code cannot be replayed.
+  twoFactorLastStep       Int?
+  twoFactorEnabledAt      DateTime?
+
+  sessions                UserSession[]
+  sentFolioDeliveries     FolioDelivery[]
+
+  orders                   Order[]
+  folioTxs                 FolioTransaction[]
+  auditLogs                AuditLog[]
+  adjustments              StockAdjustment[]
+  hkAssigned               HousekeepingTask[]       @relation("HkAssigned")
+  hkInspected              HousekeepingTask[]       @relation("HkInspected")
+  shifts                   ShiftSession[]           @relation("ShiftCashier")
+  chatConversationsCreated ChatConversation[]       @relation("ChatConversationCreator")
+  chatMemberships          ChatConversationMember[]
+  chatMessages             ChatMessage[]            @relation("ChatMessageSender")
+  uploadedGuestDocuments   GuestDocument[]          @relation("GuestDocumentUploader")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String
+  entity    String
+  entityId  String?
+  meta      Json?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([createdAt])
+  @@index([action, createdAt])
+  @@index([userId, createdAt])
+}
+
+model Setting {
+  key   String @id
+  value String
+}
+
+/// Revenue Guard: a manager's decision on one flagged exception (flagKey = "TYPE:entityId").
+model GuardReview {
+  id        String   @id @default(cuid())
+  flagKey   String   @unique
+  status    String // REVIEWED | DISMISSED
+  note      String?
+  userId    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+// ───────────── Rooms ─────────────
+model RoomType {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  description String?
+  nightlyRate Decimal @db.Decimal(14, 2)
+  capacity    Int     @default(2)
+  rooms       Room[]
+}
+
+model Room {
+  id            String              @id @default(cuid())
+  number        String              @unique
+  roomTypeId    String
+  roomType      RoomType            @relation(fields: [roomTypeId], references: [id])
+  rateOverride  Decimal?            @db.Decimal(14, 2)
+  status        RoomStatus          @default(AVAILABLE)
+  floor         Int?
+  stays         Stay[]
+  reservations  Reservation[]
+  maintenance   MaintenanceTicket[]
+  hkTasks       HousekeepingTask[]
+  qrToken       String?             @unique
+  guestRequests GuestRequest[]
+
+  @@index([status])
+}
+
+model MaintenanceTicket {
+  id          String            @id @default(cuid())
+  roomId      String?
+  room        Room?             @relation(fields: [roomId], references: [id])
+  title       String
+  description String?
+  status      MaintenanceStatus @default(OPEN)
+  createdAt   DateTime          @default(now())
+  resolvedAt  DateTime?
+}
+
+// ───────────── Guests ─────────────
+model Group {
+  id               String         @id @default(cuid())
+  name             String         @unique
+  contact          String?
+  phone            String?
+  email            String?
+  /// Most this company may owe at once. Empty means the hotel-wide default applies.
+  creditLimit      Decimal?       @db.Decimal(14, 2)
+  /// Days they have to pay. Empty means the hotel-wide default applies.
+  paymentTermsDays Int?
+  createdAt        DateTime       @default(now())
+  stays            Stay[]
+  folios           Folio[]
+  orders           Order[]
+  events           EventBooking[]
+}
+
+model Guest {
+  id               String          @id @default(cuid())
+  firstName        String
+  lastName         String
+  phone            String
+  email            String?
+  address          String?
+  idType           String?
+  idNumber         String?
+  nationality      String?
+  securityStatus   SecurityStatus  @default(PENDING)
+  securityNote     String?
+  securityAt       DateTime?
+  whatsappOptIn    Boolean         @default(false)
+  whatsappOptInAt  DateTime?
+  whatsappOptOutAt DateTime?
+  isVip            Boolean         @default(false)
+  vipNote          String?
+  /// Free text the front desk and housekeeping should know: high floor, extra pillows, allergies, no pork...
+  preferences      String?
+  /// Birthday without the year, so we never store an age.
+  birthMonth       Int?
+  birthDay         Int?
+  isBlacklisted    Boolean         @default(false)
+  blacklistReason  String?
+  blacklistedAt    DateTime?
+  blacklistedById  String?
+  createdAt        DateTime        @default(now())
+  stays            Stay[]
+  folios           Folio[]
+  orders           Order[]
+  reservations     Reservation[]
+  documents        GuestDocument[]
+
+  @@index([phone])
+  @@index([lastName, firstName])
+  @@index([isBlacklisted])
+}
+
+model Stay {
+  id                  String          @id @default(cuid())
+  guestId             String
+  guest               Guest           @relation(fields: [guestId], references: [id])
+  roomId              String
+  room                Room            @relation(fields: [roomId], references: [id])
+  groupId             String?
+  group               Group?          @relation(fields: [groupId], references: [id])
+  status              StayStatus      @default(CHECKED_IN)
+  checkInAt           DateTime        @default(now())
+  expectedDeparture   DateTime
+  checkOutAt          DateTime?
+  numGuests           Int             @default(1)
+  nightlyRate         Decimal         @db.Decimal(14, 2)
+  discountType        DiscountType    @default(NONE)
+  discountValue       Decimal         @default(0) @db.Decimal(14, 2)
+  discountReason      String?
+  isComplimentary     Boolean         @default(false)
+  complimentaryReason String?
+  authorizedBy        String?
+  applyVat            Boolean         @default(false)
+  applyServiceCharge  Boolean         @default(false)
+  specialRequests     String?
+  folio               Folio?
+  reservationId       String?         @unique
+  reservation         Reservation?    @relation(fields: [reservationId], references: [id], onDelete: SetNull)
+  extensions          StayExtension[]
+  portalPin           String?
+  guestRequests       GuestRequest[]
+  createdAt           DateTime        @default(now())
+
+  @@index([status, expectedDeparture])
+}
+
+model StayExtension {
+  id        String   @id @default(cuid())
+  stayId    String
+  stay      Stay     @relation(fields: [stayId], references: [id])
+  nights    Int
+  amount    Decimal  @db.Decimal(14, 2)
+  auto      Boolean  @default(false)
+  userId    String?
+  createdAt DateTime @default(now())
+}
+
+model AutoExtensionLog {
+  id        String   @id @default(cuid())
+  action    String
+  userId    String?
+  ip        String?
+  count     Int      @default(0)
+  revenue   Decimal  @default(0) @db.Decimal(14, 2)
+  createdAt DateTime @default(now())
+}
+
+model Reservation {
+  id        String            @id @default(cuid())
+  guestId   String
+  guest     Guest             @relation(fields: [guestId], references: [id])
+  roomId    String
+  room      Room              @relation(fields: [roomId], references: [id])
+  arrival   DateTime
+  departure DateTime
+  status    ReservationStatus @default(PENDING)
+  deposit   Decimal           @default(0) @db.Decimal(14, 2)
+  notes     String?
+  stay      Stay?
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  // Reservation integration tracking
+  source                ReservationSource     @default(FRONT_DESK)
+  externalProvider      String?
+  externalReservationId String?
+  syncStatus            ReservationSyncStatus @default(NOT_REQUIRED)
+  lastSyncedAt          DateTime?
+
+  @@unique([externalProvider, externalReservationId])
+  @@index([arrival, departure])
+  @@index([source, createdAt])
+}
+
+// ───────────── Folios ─────────────
+model Folio {
+  id        String             @id @default(cuid())
+  folioNo   String             @unique
+  stayId    String?            @unique
+  stay      Stay?              @relation(fields: [stayId], references: [id])
+  guestId   String?
+  guest     Guest?             @relation(fields: [guestId], references: [id])
+  groupId   String?
+  group     Group?             @relation(fields: [groupId], references: [id])
+  status    FolioStatus        @default(ACTIVE)
+  createdAt DateTime           @default(now())
+  txs       FolioTransaction[]
+ deliveries FolioDelivery[]
+
+  @@index([status])
+}
+
+model FolioTransaction {
+  id           String         @id @default(cuid())
+  folioId      String
+  folio        Folio          @relation(fields: [folioId], references: [id])
+  type         TxType
+  description  String
+  bill         Decimal        @default(0) @db.Decimal(14, 2)
+  payment      Decimal        @default(0) @db.Decimal(14, 2)
+  method       PaymentMethod?
+  salesPointId String?
+  salesPoint   SalesPoint?    @relation(fields: [salesPointId], references: [id])
+  journalId    String?
+  userId       String?
+  user         User?          @relation(fields: [userId], references: [id])
+  createdAt    DateTime       @default(now())
+
+  @@index([folioId, createdAt])
+}
+
+// ───────────── Sales / POS / Orders ─────────────
+model SalesPoint {
+  id       String             @id @default(cuid())
+  name     String             @unique
+  isActive Boolean            @default(true)
+  items    InventoryItem[]
+  orders   Order[]
+  folioTxs FolioTransaction[]
+  returns  StockReturn[]
+}
+
+model Order {
+  id              String        @id @default(cuid())
+  orderNo         String        @unique
+  idempotencyKey  String?       @unique
+  requestHash     String?
+  customerType    CustomerType  @default(WALK_IN)
+  guestId         String?
+  guest           Guest?        @relation(fields: [guestId], references: [id])
+  groupId         String?
+  group           Group?        @relation(fields: [groupId], references: [id])
+  salesPointId    String
+  salesPoint      SalesPoint    @relation(fields: [salesPointId], references: [id])
+  staffId         String
+  staff           User          @relation(fields: [staffId], references: [id])
+  status          OrderStatus   @default(PENDING)
+  paymentStatus   PaymentStatus @default(PENDING)
+  paymentMethod   PaymentMethod @default(CASH)
+  subtotal        Decimal       @db.Decimal(14, 2)
+  vat             Decimal       @default(0) @db.Decimal(14, 2)
+  serviceCharge   Decimal       @default(0) @db.Decimal(14, 2)
+  total           Decimal       @db.Decimal(14, 2)
+  isComplimentary Boolean       @default(false)
+  isStaffCredit   Boolean       @default(false)
+  instructions    String?
+  notes           String?
+  voidedAt        DateTime?
+  voidReason      String?
+  items           OrderItem[]
+  createdAt       DateTime      @default(now())
+
+  @@index([status, createdAt])
+  @@index([paymentStatus])
+}
+
+model OrderItem {
+  id           String        @id @default(cuid())
+  orderId      String
+  order        Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  itemId       String
+  item         InventoryItem @relation(fields: [itemId], references: [id])
+  quantity     Int
+  unitPrice    Decimal       @db.Decimal(14, 2)
+  unitCost     Decimal       @default(0) @db.Decimal(14, 2)
+  instructions String?
+}
+
+// ───────────── Inventory & Stores ─────────────
+model InventoryCategory {
+  id        String          @id @default(cuid())
+  name      String
+  section   MenuSection     @default(FOOD)
+  sortOrder Int             @default(0)
+  isActive  Boolean         @default(true)
+  items     InventoryItem[]
+
+  @@unique([section, name])
+}
+
+model InventoryItem {
+  id            String              @id @default(cuid())
+  code          Int                 @default(autoincrement())
+  name          String
+  description   String?
+  categoryId    String
+  category      InventoryCategory   @relation(fields: [categoryId], references: [id])
+  salesPointId  String
+  salesPoint    SalesPoint          @relation(fields: [salesPointId], references: [id])
+  sellPrice     Decimal             @db.Decimal(14, 2)
+  costPrice     Decimal             @default(0) @db.Decimal(14, 2)
+  quantity      Decimal             @default(0) @db.Decimal(18, 6)
+  minLevel      Decimal             @default(5) @db.Decimal(14, 3)
+  isActive      Boolean             @default(true)
+  orderItems    OrderItem[]
+  movements     StockMovement[]
+  adjustments   StockAdjustment[]
+  storeItems    StoreItem[]
+  returns       StockReturn[]
+  poItems       PurchaseOrderItem[]
+  recipeLines   RecipeLine[]        @relation("RecipeDish")
+  usedInRecipes RecipeLine[]        @relation("RecipeIngredient")
+
+  @@index([categoryId])
+  @@index([salesPointId])
+}
+
+model StockMovement {
+  id        String        @id @default(cuid())
+  itemId    String
+  item      InventoryItem @relation(fields: [itemId], references: [id])
+  storeId   String?
+  store     Store?        @relation(fields: [storeId], references: [id])
+  type      MovementType
+  quantity  Decimal       @db.Decimal(18, 6)
+  balance   Decimal       @db.Decimal(18, 6)
+  reference String?
+  userId    String?
+  createdAt DateTime      @default(now())
+
+  @@index([itemId, createdAt])
+}
+
+model StockAdjustment {
+  id            String           @id @default(cuid())
+  itemId        String
+  item          InventoryItem    @relation(fields: [itemId], references: [id])
+  storeId       String?
+  store         Store?           @relation(fields: [storeId], references: [id])
+  delta         Decimal          @db.Decimal(14, 3)
+  reason        String
+  status        AdjustmentStatus @default(PENDING)
+  requestedById String
+  requestedBy   User             @relation(fields: [requestedById], references: [id])
+  approvedById  String?
+  createdAt     DateTime         @default(now())
+  decidedAt     DateTime?
+}
+
+model Store {
+  id            String            @id @default(cuid())
+  name          String            @unique
+  items         StoreItem[]
+  movements     StockMovement[]
+  adjustments   StockAdjustment[]
+  issuesFrom    StockIssue[]      @relation("IssueFrom")
+  transfersFrom StockTransfer[]   @relation("TransferFrom")
+  transfersTo   StockTransfer[]   @relation("TransferTo")
+}
+
+model StoreItem {
+  id       String        @id @default(cuid())
+  storeId  String
+  store    Store         @relation(fields: [storeId], references: [id])
+  itemId   String
+  item     InventoryItem @relation(fields: [itemId], references: [id])
+  quantity Decimal       @default(0) @db.Decimal(14, 3)
+  minLevel Decimal       @default(10) @db.Decimal(14, 3)
+
+  @@unique([storeId, itemId])
+}
+
+model StockReturn {
+  id           String        @id @default(cuid())
+  returnNo     String        @unique
+  itemId       String
+  item         InventoryItem @relation(fields: [itemId], references: [id])
+  salesPointId String
+  salesPoint   SalesPoint    @relation(fields: [salesPointId], references: [id])
+  quantity     Decimal       @db.Decimal(14, 3)
+  amount       Decimal       @db.Decimal(14, 2)
+  disposition  String
+  status       String        @default("PENDING")
+  createdAt    DateTime      @default(now())
+}
+
+model StockIssue {
+  id           String   @id @default(cuid())
+  storeId      String
+  store        Store    @relation("IssueFrom", fields: [storeId], references: [id])
+  itemId       String
+  salesPointId String
+  quantity     Decimal  @db.Decimal(14, 3)
+  createdAt    DateTime @default(now())
+}
+
+model StockTransfer {
+  id          String   @id @default(cuid())
+  fromStoreId String
+  from        Store    @relation("TransferFrom", fields: [fromStoreId], references: [id])
+  toStoreId   String
+  to          Store    @relation("TransferTo", fields: [toStoreId], references: [id])
+  itemId      String
+  quantity    Decimal  @db.Decimal(14, 3)
+  createdAt   DateTime @default(now())
+}
+
+// ───────────── Events ─────────────
+model Facility {
+  id       String         @id @default(cuid())
+  name     String         @unique
+  capacity Int?
+  events   EventBooking[]
+}
+
+model EventBooking {
+  id             String      @id @default(cuid())
+  title          String
+  clientName     String
+  clientPhone    String?
+  groupId        String?
+  group          Group?      @relation(fields: [groupId], references: [id])
+  facilityId     String
+  facility       Facility    @relation(fields: [facilityId], references: [id])
+  startsAt       DateTime
+  endsAt         DateTime
+  expectedGuests Int         @default(0)
+  quoted         Decimal     @default(0) @db.Decimal(14, 2)
+  paid           Decimal     @default(0) @db.Decimal(14, 2)
+  status         EventStatus @default(INQUIRY)
+  notes          String?
+  createdAt      DateTime    @default(now())
+
+  @@index([startsAt])
+}
+
+// ───────────── Accounting ─────────────
+model Account {
+  id       String        @id @default(cuid())
+  code     String        @unique
+  name     String
+  type     AccountType
+  category String?
+  isActive Boolean       @default(true)
+  isSystem Boolean       @default(false)
+  lines    JournalLine[]
+}
+
+model JournalEntry {
+  id          String        @id @default(cuid())
+  txnNo       Int           @default(autoincrement())
+  date        DateTime      @default(now())
+  description String
+  reference   String?
+  createdById String?
+  lines       JournalLine[]
+  createdAt   DateTime      @default(now())
+
+  @@index([date])
+}
+
+model JournalLine {
+  id        String       @id @default(cuid())
+  entryId   String
+  entry     JournalEntry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  accountId String
+  account   Account      @relation(fields: [accountId], references: [id])
+  debit     Decimal      @default(0) @db.Decimal(14, 2)
+  credit    Decimal      @default(0) @db.Decimal(14, 2)
+  memo      String?
+
+  @@index([accountId])
+}
+
+model Supplier {
+  id     String          @id @default(cuid())
+  name   String          @unique
+  phone  String?
+  email  String?
+  orders PurchaseOrder[]
+}
+
+model PurchaseOrder {
+  id         String              @id @default(cuid())
+  poNo       String              @unique
+  supplierId String
+  supplier   Supplier            @relation(fields: [supplierId], references: [id])
+  status     POStatus            @default(DRAFT)
+  total      Decimal             @default(0) @db.Decimal(14, 2)
+  notes      String?
+  items      PurchaseOrderItem[]
+  createdAt  DateTime            @default(now())
+  receivedAt DateTime?
+}
+
+model PurchaseOrderItem {
+  id       String        @id @default(cuid())
+  poId     String
+  po       PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Cascade)
+  itemId   String
+  item     InventoryItem @relation(fields: [itemId], references: [id])
+  quantity Decimal       @db.Decimal(14, 3)
+  unitCost Decimal       @db.Decimal(14, 2)
+}
+
+model Employee {
+  id                 String    @id @default(cuid())
+  fullName           String
+  position           String?
+  department         String?
+  phone              String?
+  /// Basic salary, per month. (Kept under its old name so existing records keep working.)
+  baseSalary         Decimal   @default(0) @db.Decimal(14, 2)
+  housingAllowance   Decimal   @default(0) @db.Decimal(14, 2)
+  transportAllowance Decimal   @default(0) @db.Decimal(14, 2)
+  otherAllowances    Decimal   @default(0) @db.Decimal(14, 2)
+  /// Annual rent the employee pays, for rent relief. Relief is only given when proof is on file (if the hotel requires it).
+  annualRent         Decimal   @default(0) @db.Decimal(14, 2)
+  rentProofOnFile    Boolean   @default(false)
+  /// Other yearly tax-deductible items the accountant decides to allow (e.g. health insurance, life insurance).
+  otherAnnualReliefs Decimal   @default(0) @db.Decimal(14, 2)
+  pensionEnrolled    Boolean   @default(true)
+  nhfEnrolled        Boolean   @default(false)
+  pfaName            String?
+  rsaPin             String?
+  tin                String?
+  stateOfResidence   String?
+  bankName           String?
+  accountNumber      String?
+  isActive           Boolean   @default(true)
+  payslips           Payslip[]
+}
+
+model PayrollPeriod {
+  id             String              @id @default(cuid())
+  name           String
+  startDate      DateTime
+  endDate        DateTime
+  status         PayrollStatus       @default(DRAFT)
+  payslips       Payslip[]
+  /// The rates and tax bands used for this run, kept so an old payslip can always be explained.
+  configSnapshot Json?
+  approvedAt     DateTime?
+  paidAt         DateTime?
+  remittances    PayrollRemittance[]
+  createdAt      DateTime            @default(now())
+}
+
+model Payslip {
+  id              String        @id @default(cuid())
+  periodId        String
+  period          PayrollPeriod @relation(fields: [periodId], references: [id], onDelete: Cascade)
+  employeeId      String
+  employee        Employee      @relation(fields: [employeeId], references: [id])
+  /// Total pay before deductions (basic + allowances + bonus).
+  gross           Decimal       @db.Decimal(14, 2)
+  /// Everything taken from the employee: pension + NHF + PAYE + other deductions.
+  deductions      Decimal       @default(0) @db.Decimal(14, 2)
+  net             Decimal       @db.Decimal(14, 2)
+  basic           Decimal       @default(0) @db.Decimal(14, 2)
+  housing         Decimal       @default(0) @db.Decimal(14, 2)
+  transport       Decimal       @default(0) @db.Decimal(14, 2)
+  otherAllow      Decimal       @default(0) @db.Decimal(14, 2)
+  bonus           Decimal       @default(0) @db.Decimal(14, 2)
+  pensionEmployee Decimal       @default(0) @db.Decimal(14, 2)
+  pensionEmployer Decimal       @default(0) @db.Decimal(14, 2)
+  nhf             Decimal       @default(0) @db.Decimal(14, 2)
+  rentRelief      Decimal       @default(0) @db.Decimal(14, 2)
+  taxableAnnual   Decimal       @default(0) @db.Decimal(14, 2)
+  paye            Decimal       @default(0) @db.Decimal(14, 2)
+  otherDeductions Decimal       @default(0) @db.Decimal(14, 2)
+  deductionNote   String?
+  nsitf           Decimal       @default(0) @db.Decimal(14, 2)
+  itf             Decimal       @default(0) @db.Decimal(14, 2)
+
+  @@index([periodId])
+}
+
+/// Money paid over to the tax office, pension companies and so on, for one payroll period.
+model PayrollRemittance {
+  id        String        @id @default(cuid())
+  periodId  String
+  period    PayrollPeriod @relation(fields: [periodId], references: [id], onDelete: Cascade)
+  kind      String
+  amount    Decimal       @db.Decimal(14, 2)
+  method    String
+  reference String?
+  userId    String?
+  paidAt    DateTime      @default(now())
+
+  @@index([periodId])
+}
+
+// ───────────── Shifts ─────────────
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+/// One cashier's cash drawer for one shift. Closing compares declared cash with what the books say was collected.
+model ShiftSession {
+  id           String      @id @default(cuid())
+  name         ShiftName
+  date         DateTime    @db.Date
+  cashierId    String?
+  cashier      User?       @relation("ShiftCashier", fields: [cashierId], references: [id])
+  openedAt     DateTime    @default(now())
+  openingFloat Decimal     @default(0) @db.Decimal(14, 2)
+  status       ShiftStatus @default(OPEN)
+  closedAt     DateTime?
+  closedById   String?
+  expectedCash Decimal?    @db.Decimal(14, 2)
+  declaredCash Decimal?    @db.Decimal(14, 2)
+  overShort    Decimal?    @db.Decimal(14, 2)
+  nonCashTotal Decimal?    @db.Decimal(14, 2)
+  notes        String?
+
+  @@index([date])
+  @@index([cashierId, status])
+}
+
+/// A closed business date. The stored report is the manager's report and never changes.
+model NightAudit {
+  id         String   @id @default(cuid())
+  date       DateTime @unique @db.Date
+  closedAt   DateTime @default(now())
+  closedById String?
+  report     Json
+  notes      String?
+}
+
+// ───────────── WhatsApp messaging ─────────────
+enum MsgStatus {
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  SKIPPED
+}
+
+/// Every outbound WhatsApp message goes through here: retries, dedupe, delivery trail.
+model MessageOutbox {
+  id            String    @id @default(cuid())
+  dedupeKey     String    @unique
+  toPhone       String
+  template      String
+  lang          String    @default("en")
+  params        Json
+  guestId       String?
+  status        MsgStatus @default(QUEUED)
+  attempts      Int       @default(0)
+  nextAttemptAt DateTime  @default(now())
+  providerMsgId String?   @unique
+  error         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([status, nextAttemptAt])
+  @@index([createdAt])
+}
+
+model OwnerRecipient {
+  id         String   @id @default(cuid())
+  name       String
+  phone      String
+  active     Boolean  @default(true)
+  digestHour Int      @default(21)
+  createdAt  DateTime @default(now())
+}
+
+// ───────────── Recipes: a dish or a shot is made of stock items ─────────────
+/// When a dish with recipe lines is sold, its ingredients are deducted instead of the dish itself.
+/// A shot of whisky is a dish whose one ingredient is the bottle: quantity = 1 / shots-per-bottle.
+model RecipeLine {
+  id           String        @id @default(cuid())
+  dishId       String
+  dish         InventoryItem @relation("RecipeDish", fields: [dishId], references: [id], onDelete: Cascade)
+  ingredientId String
+  ingredient   InventoryItem @relation("RecipeIngredient", fields: [ingredientId], references: [id])
+  quantity     Decimal       @db.Decimal(18, 6)
+
+  @@unique([dishId, ingredientId])
+  @@index([ingredientId])
+}
+
+// ───────────── Housekeeping ─────────────
+enum HkTaskType {
+  CHECKOUT_CLEAN
+  STAYOVER
+  MANUAL
+}
+
+enum HkTaskStatus {
+  PENDING
+  IN_PROGRESS
+  READY_FOR_INSPECTION
+  DONE
+  CANCELLED
+}
+
+/// One cleaning job for one room. A checkout creates it; inspection returns the room to AVAILABLE.
+model HousekeepingTask {
+  id             String       @id @default(cuid())
+  roomId         String
+  room           Room         @relation(fields: [roomId], references: [id])
+  type           HkTaskType   @default(CHECKOUT_CLEAN)
+  status         HkTaskStatus @default(PENDING)
+  assignedToId   String?
+  assignedTo     User?        @relation("HkAssigned", fields: [assignedToId], references: [id])
+  checklist      Json
+  notes          String?
+  reworkCount    Int          @default(0)
+  createdAt      DateTime     @default(now())
+  assignedAt     DateTime?
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  inspectedAt    DateTime?
+  inspectedById  String?
+  inspectedBy    User?        @relation("HkInspected", fields: [inspectedById], references: [id])
+  inspectionNote String?
+
+  @@index([status])
+  @@index([roomId, status])
+  @@index([assignedToId])
+  @@index([createdAt])
+}
+
+// ───────────── Guest QR portal ─────────────
+enum GuestRequestType {
+  ORDER
+  SERVICE
+  FEEDBACK
+}
+
+enum GuestRequestStatus {
+  NEW
+  ACCEPTED
+  DONE
+  DECLINED
+  CANCELLED
+}
+
+/// Something a guest asked for from the room QR page. Staff confirm before anything is charged.
+model GuestRequest {
+  id             String             @id @default(cuid())
+  stayId         String
+  stay           Stay               @relation(fields: [stayId], references: [id])
+  roomId         String
+  room           Room               @relation(fields: [roomId], references: [id])
+  type           GuestRequestType
+  status         GuestRequestStatus @default(NEW)
+  kind           String?
+  text           String?
+  items          Json?
+  estimatedTotal Decimal?           @db.Decimal(14, 2)
+  rating         Int?
+  orderId        String?
+  handledById    String?
+  handledAt      DateTime?
+  declineReason  String?
+  createdAt      DateTime           @default(now())
+
+  @@index([status, createdAt])
+  @@index([stayId])
+}
+
+// ───────────── Power: diesel and generators ─────────────
+model Generator {
+  id            String         @id @default(cuid())
+  name          String         @unique
+  /// Litres burned per running hour at a normal load. The hotel sets this; it is used to spot missing diesel.
+  litresPerHour Decimal?       @db.Decimal(8, 2)
+  isActive      Boolean        @default(true)
+  runs          GeneratorRun[]
+}
+
+model GeneratorRun {
+  id          String    @id @default(cuid())
+  date        DateTime  @db.Date
+  generatorId String
+  generator   Generator @relation(fields: [generatorId], references: [id])
+  hours       Decimal   @db.Decimal(6, 2)
+  notes       String?
+  userId      String?
+  createdAt   DateTime  @default(now())
+
+  @@unique([date, generatorId])
+}
+
+/// Fuel in the tank, measured with a dip stick or gauge.
+model TankDip {
+  id        String   @id @default(cuid())
+  date      DateTime @unique @db.Date
+  litres    Decimal  @db.Decimal(12, 2)
+  userId    String?
+  createdAt DateTime @default(now())
+}
+
+model DieselPurchase {
+  id            String   @id @default(cuid())
+  date          DateTime @db.Date
+  litres        Decimal  @db.Decimal(12, 2)
+  pricePerLitre Decimal  @db.Decimal(12, 2)
+  total         Decimal  @db.Decimal(14, 2)
+  supplier      String?
+  paidFrom      String
+  reference     String?
+  userId        String?
+  createdAt     DateTime @default(now())
+
+  @@index([date])
+}
+
+enum StaffNotificationStatus {
+  UNREAD
+  READ
+  ARCHIVED
+}
+
+model StaffNotification {
+  id              String                  @id @default(cuid())
+  recipientUserId String
+  createdByUserId String?
+  title           String
+  body            String
+  category        String                  @default("GENERAL")
+  entityType      String?
+  entityId        String?
+  status          StaffNotificationStatus @default(UNREAD)
+  readAt          DateTime?
+  createdAt       DateTime                @default(now())
+
+  @@index([recipientUserId, status, createdAt])
+  @@index([createdAt])
+}
+
+model ChatConversation {
+  id          String                   @id @default(cuid())
+  type        ChatConversationType
+  name        String?
+  createdById String
+  createdBy   User                     @relation("ChatConversationCreator", fields: [createdById], references: [id], onDelete: Restrict)
+  members     ChatConversationMember[]
+  messages    ChatMessage[]
+  createdAt   DateTime                 @default(now())
+  updatedAt   DateTime                 @updatedAt
+
+  @@index([updatedAt])
+  @@index([createdById])
+}
+
+model ChatConversationMember {
+  id             String           @id @default(cuid())
+  conversationId String
+  conversation   ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  joinedAt       DateTime         @default(now())
+  lastReadAt     DateTime?
+
+  @@unique([conversationId, userId])
+  @@index([userId, joinedAt])
+}
+
+model ChatMessage {
+  id             String           @id @default(cuid())
+  conversationId String
+  conversation   ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  senderId       String
+  sender         User             @relation("ChatMessageSender", fields: [senderId], references: [id], onDelete: Restrict)
+  body           String           @db.VarChar(4000)
+  createdAt      DateTime         @default(now())
+  editedAt       DateTime?
+
+  @@index([conversationId, createdAt])
+  @@index([senderId, createdAt])
+}
+
+/// Supported transaction currencies. The base currency is configured in Setting
+/// using key BASE_CURRENCY; it must not be changed casually after posting begins.
+model Currency {
+  code          String   @id @db.VarChar(3)
+  name          String
+  symbol        String
+  decimalPlaces Int      @default(2)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  ratesFrom FxRate[] @relation("FxRateFrom")
+  ratesTo   FxRate[] @relation("FxRateTo")
+
+  @@index([isActive, name])
+}
+
+/// Immutable, effective-dated FX quote.
+/// rate means: 1 unit of fromCurrency = rate units of toCurrency.
+model FxRate {
+  id               String   @id @default(cuid())
+  fromCurrencyCode String   @db.VarChar(3)
+  toCurrencyCode   String   @db.VarChar(3)
+  rate             Decimal  @db.Decimal(20, 10)
+  effectiveFrom    DateTime @default(now())
+  createdById      String?
+  reason           String?
+  createdAt        DateTime @default(now())
+
+  fromCurrency Currency @relation("FxRateFrom", fields: [fromCurrencyCode], references: [code], onDelete: Restrict)
+  toCurrency   Currency @relation("FxRateTo", fields: [toCurrencyCode], references: [code], onDelete: Restrict)
+
+  @@unique([fromCurrencyCode, toCurrencyCode, effectiveFrom])
+  @@index([fromCurrencyCode, toCurrencyCode, effectiveFrom])
+  @@index([createdAt])
+}
+
+model GuestDocument {
+  id           String   @id @default(cuid())
+  guestId      String
+  uploadedById String?
+  category     String
+  originalName String
+  storageKey   String   @unique
+  mimeType     String
+  sizeBytes    Int
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  guest      Guest @relation(fields: [guestId], references: [id], onDelete: Restrict)
+  uploadedBy User? @relation("GuestDocumentUploader", fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  @@index([guestId, createdAt])
+  @@index([uploadedById])
+  @@index([category])
+}
+
+model ReservationIntegrationEvent {
+  id          String                 @id @default(cuid())
+  provider    String
+  eventId     String
+  status      IntegrationEventStatus @default(RECEIVED)
+  payload     Json
+  attempts    Int                    @default(0)
+  error       String?
+  receivedAt  DateTime               @default(now())
+  processedAt DateTime?
+  updatedAt   DateTime               @default(now()) @updatedAt
+
+  @@unique([provider, eventId])
+  @@index([status, receivedAt])
+}
+
+/// One row per signed-in device. The JWT carries this id (claim "sid"); revoking the row logs that device out.
+model UserSession {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceLabel   String
+  userAgent     String?
+  ip            String?
+  createdAt     DateTime  @default(now())
+  lastSeenAt    DateTime  @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  revokedReason String?
+  revokedById   String?
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+}
+
+
+/// Log of every folio / receipt that was sent to a guest.
+model FolioDelivery {
+  id          String          @id @default(cuid())
+  folioId     String
+  folio       Folio           @relation(fields: [folioId], references: [id], onDelete: Cascade)
+  txId        String?
+  kind        String
+  channel     DeliveryChannel
+  recipient   String
+  status      DeliveryStatus  @default(QUEUED)
+  error       String?
+  providerRef String?
+  sentById    String?
+  sentBy      User?           @relation(fields: [sentById], references: [id])
+  createdAt   DateTime        @default(now())
+
+  @@index([folioId, createdAt])
+  @@index([status, createdAt])
+}

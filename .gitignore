@@ -1,0 +1,7 @@
+node_modules
+dist
+.env
+*.log
+PRD.md
+TRD.md
+readme.md
