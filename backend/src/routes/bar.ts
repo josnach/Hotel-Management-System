@@ -6,6 +6,7 @@ import { audit } from '../lib/audit';
 import { D, prisma } from '../lib/prisma';
 import { requireRole } from '../middleware/auth';
 import { getFoodCostTarget } from '../services/policy';
+import { nextAdjustmentNumber } from '../lib/adjustment-number';
 
 export const barRouter = Router();
 const manage = requireRole('MANAGER');            // ADMIN and MANAGER: change recipes
@@ -133,7 +134,20 @@ barRouter.post('/counts', stock, asyncHandler(async (req, res) => {
     const delta = D(c.counted).minus(it.quantity).toDecimalPlaces(3);
     let created = false;
     if (!delta.isZero() && !hasPending.has(it.id)) {
-      await prisma.stockAdjustment.create({ data: { itemId: it.id, delta, reason: `Stock count: counted ${c.counted}, system ${num(it.quantity)}`, requestedById: req.user!.id } });
+      await prisma.$transaction(async (tx) => {
+  const adjustmentNumber = await nextAdjustmentNumber(tx);
+
+  return tx.stockAdjustment.create({
+    data: {
+      adjustmentNumber,
+      itemId: it.id,
+      delta,
+      reason: `Stock count: counted ${c.counted}, system ${num(it.quantity)}`,
+      reasonCategory: 'Inventory Count Adjustment',
+      requestedById: req.user!.id,
+    },
+  });
+});
       created = true;
     }
     rows.push({ itemId: it.id, name: it.name, system: num(it.quantity), counted: c.counted, variance: num(delta), varianceValue: Math.round(num(delta) * num(it.costPrice)), adjustmentRaised: created, alreadyPending: !delta.isZero() && !created });

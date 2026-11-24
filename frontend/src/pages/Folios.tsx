@@ -30,7 +30,13 @@ export default function Folios() {
         { header: 'Check-in', cell: (f: any) => <div>{d(f.createdAt)}<div className="text-xs text-muted-foreground">{new Date(f.createdAt).toLocaleTimeString('en-NG', { hour: '2-digit', minute: '2-digit' })}</div></div> },
         { header: 'Balance', cell: (f: any) => <span className="font-semibold text-red-600">{money(f.balance)}</span> },
         { header: 'Status', cell: (f: any) => <Badge variant={statusVariant(f.status)}>{f.status === 'ACTIVE' ? 'Checked in' : f.status === 'CHECKED_OUT' ? 'Checked out' : 'Settled'}</Badge> },
-        { header: 'Actions', cell: (f: any) => <div className="flex gap-3"><Link to={`/folios/${f.id}`} className="text-blue-700"><Eye className="h-4 w-4" /></Link><Link to={`/folios/${f.id}?print=1`}><Printer className="h-4 w-4" /></Link></div> },
+        { header: 'Actions', cell: (f: any) => <div className="flex gap-3"><Link to={`/folios/${f.id}`} className="text-blue-700"><Eye className="h-4 w-4" /></Link><Link
+  to={`/folios/${f.id}/print-preview`}
+  title="Print guest folio"
+  className="text-slate-700 hover:text-blue-700"
+>
+  <Printer className="h-4 w-4" />
+</Link></div> },
       ]} />
     </>
   );

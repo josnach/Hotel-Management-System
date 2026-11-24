@@ -1,14 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Minus,
   Plus,
   Trash2,
   RefreshCw,
+  Store,
   Wifi,
   WifiOff,
 } from 'lucide-react';
 import { toast } from 'sonner';
+import { useNavigate, useLocation } from 'react-router-dom';
 
 import { useAuth } from '@/lib/auth';
 import { useGet } from '@/lib/hooks';
@@ -16,13 +19,18 @@ import { cn, money } from '@/lib/utils';
 
 import {
   enqueueOrder,
-   getPosMenuData,
+  getPosMenuData,
   listOfflineOrders,
   retryFailedOrder,
   subscribeToQueueChanges,
   syncPendingOrders,
   type OfflineOrder,
 } from '@/lib/offline-pos';
+
+import {
+  fetchOrderForPrinting,
+  printKitchenDocket,
+} from '@/lib/pos-print';
 
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -40,6 +48,7 @@ type Section = (typeof SECTIONS)[number][0];
 export default function POS() {
   const queryClient = useQueryClient();
   const { user } = useAuth();
+  const navigate = useNavigate();
 
   // --------------------------------------------------
   // Offline POS state
@@ -52,6 +61,9 @@ export default function POS() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [submittingOrder, setSubmittingOrder] = useState(false);
   const [offlineOrders, setOfflineOrders] = useState<OfflineOrder[]>([]);
+  const [lastSyncedOrderId, setLastSyncedOrderId] = useState<string | null>(
+    null,
+  );
 
   const refreshOfflineOrders = useCallback(async () => {
     try {
@@ -144,8 +156,10 @@ export default function POS() {
 
     return () => {
       mounted = false;
+
       window.removeEventListener('online', onOnline);
       window.removeEventListener('offline', onOffline);
+
       unsubscribe();
     };
   }, [refreshOfflineOrders, invalidateOrderQueries]);
@@ -186,28 +200,30 @@ export default function POS() {
   // Sales points, categories, cart and payment state
   // --------------------------------------------------
 
-const { data: sps } = useQuery<any[]>({
-  queryKey: ['pos-menu', 'sales-points'],
-  queryFn: () => getPosMenuData<any[]>('/sales-points'),
-  networkMode: 'always',
-  retry: false,
-});
+  const { data: sps } = useQuery<any[]>({
+    queryKey: ['pos-menu', 'sales-points'],
+    queryFn: () => getPosMenuData<any[]>('/sales-points'),
+    networkMode: 'always',
+    retry: false,
+  });
 
-const [sp, setSp] = useState('');
-
-const { data: cat, isError: menuError } = useQuery<any>({
-  queryKey: ['pos-menu', 'catalog', sp],
-  queryFn: () => getPosMenuData<any>(`/sales-points/${sp}/catalog`),
-  enabled: !!sp,
-  networkMode: 'always',
-  retry: false,
-});
-
+  const [sp, setSp] = useState('');
+    const current = sps?.find((s: any) => s.id === sp);
   const [section, setSection] = useState<Section>('FOOD');
-  const [catId, setCatId] = useState('');
-  const [cart, setCart] = useState<Record<string, number>>({});
-  const [method, setMethod] = useState('');
+  const { data: cat, isError: menuError } = useQuery<any>({
+    queryKey: ['pos-menu', 'catalog', sp],
+    queryFn: () => getPosMenuData<any>(`/sales-points/${sp}/catalog`),
+    enabled: !!sp,
+    networkMode: 'always',
+    retry: false,
+  });
 
+const [catId, setCatId] = useState('');
+const [cart, setCart] = useState<Record<string, number>>({});
+const [method, setMethod] = useState('');
+const [guestType, setGuestType] = useState<'WALK_IN' | 'GUEST'>(
+  'WALK_IN',
+);
   const [flags, setFlags] = useState({
     comp: false,
     vat: false,
@@ -217,17 +233,31 @@ const { data: cat, isError: menuError } = useQuery<any>({
 
   const [guestId, setGuestId] = useState('');
   const [note, setNote] = useState('');
+    // Sales Points menu: /pos?salesPoint=<id> preselects that sales point.
+  const location = useLocation();
+  const appliedNav = useRef<string | null>(null);
+
+  useEffect(() => {
+    const id = new URLSearchParams(location.search).get('salesPoint');
+    if (!id || appliedNav.current === location.key) return;
+    if (!sps?.some((s: any) => s.id === id)) return; // wait until the list has loaded
+
+    appliedNav.current = location.key;
+    setSp(id);
+    setCart({});   // same reset your dropdown does when you switch
+    setCatId('');
+  }, [location.key, location.search, sps]);
 
   const canApprove =
     user?.role === 'ADMIN' || user?.role === 'MANAGER';
 
   const needsNote = flags.comp || flags.staff;
 
-  const { data: inHouse } = useGet<any[]>(
-    '/stays/in-house',
-    undefined,
-    method === 'ROOM_CHARGE',
-  );
+ const { data: inHouse } = useGet<any[]>(
+  '/stays/in-house',
+  undefined,
+  guestType === 'GUEST',
+);
 
   const items: any[] = cat?.items ?? [];
   const allCats: any[] = cat?.categories ?? [];
@@ -278,33 +308,36 @@ const { data: cat, isError: menuError } = useQuery<any>({
         : remaining;
     });
   };
+const resetOrder = () => {
+  setCart({});
+  setNote('');
+  setGuestId('');
+  setGuestType('WALK_IN');
 
-  const resetOrder = () => {
-    setCart({});
-    setNote('');
-    setGuestId('');
-
-    setFlags((current) => ({
-      ...current,
-      comp: false,
-      staff: false,
-    }));
-  };
+  setFlags((current) => ({
+    ...current,
+    comp: false,
+    staff: false,
+  }));
+};
 
   // --------------------------------------------------
   // Complete sale: enqueue first, then synchronize
+  // Print only after server synchronization succeeds.
   // --------------------------------------------------
 
   const submitOrder = async () => {
-    if (
-      !lines.length ||
-      !method ||
-      !sp ||
-      (needsNote && note.trim().length < 3) ||
-      (method === 'ROOM_CHARGE' && !guestId)
-    ) {
-      return;
-    }
+   if (
+  !lines.length ||
+  !method ||
+  !sp ||
+  (guestType === 'GUEST' && !guestId) ||
+  (method === 'ROOM_CHARGE' &&
+    (guestType !== 'GUEST' || !guestId)) ||
+  (needsNote && note.trim().length < 3)
+) {
+  return;
+}
 
     if (flags.comp && !canApprove) {
       toast.error(
@@ -315,13 +348,25 @@ const { data: cat, isError: menuError } = useQuery<any>({
 
     if (submittingOrder) return;
 
+    // Open synchronously from the click handler so popup blockers
+    // are less likely to prevent printing after the server request.
+    const printWindow = window.open(
+      '',
+      '_blank',
+      'width=480,height=720',
+    );
+
+    if (!printWindow) {
+      toast.error('Allow pop-ups to print the kitchen docket.');
+    }
+
     setSubmittingOrder(true);
 
     const salesPointId = sp;
 
-    const payload = {
-      customerType: method === 'ROOM_CHARGE' ? 'GUEST' : 'WALK_IN',
-      guestId: guestId || undefined,
+  const payload = {
+  customerType: guestType,
+  guestId: guestType === 'GUEST' ? guestId : undefined,
       salesPointId,
       paymentMethod: flags.staff ? 'STAFF_CREDIT' : method,
       items: lines.map((line) => ({
@@ -350,8 +395,10 @@ const { data: cat, isError: menuError } = useQuery<any>({
           : 'Order saved on this device and queued for synchronization',
       );
 
+      // IMPORTANT: Close the unused print window when offline.
       if (!navigator.onLine) {
         setIsOnline(false);
+        printWindow?.close();
         return;
       }
 
@@ -368,7 +415,11 @@ const { data: cat, isError: menuError } = useQuery<any>({
           (order) => order.id === queuedOrder.id,
         );
 
-        if (latest?.status === 'synced') {
+        // Print only when synchronization succeeded and the server
+        // returned a real server order ID.
+        if (latest?.status === 'synced' && latest.serverOrderId) {
+          setLastSyncedOrderId(latest.serverOrderId);
+
           toast.success('Order accepted by the server');
 
           await invalidateOrderQueries();
@@ -376,21 +427,55 @@ const { data: cat, isError: menuError } = useQuery<any>({
           await queryClient.invalidateQueries({
             queryKey: [`/sales-points/${salesPointId}/catalog`],
           });
+
+          if (printWindow && !printWindow.closed) {
+            try {
+              const savedOrder = await fetchOrderForPrinting(
+                latest.serverOrderId,
+              );
+
+              printKitchenDocket(printWindow, savedOrder);
+            } catch (error) {
+              printWindow.close();
+
+              toast.error(
+                error instanceof Error
+                  ? `Order saved, but printing failed: ${error.message}`
+                  : 'Order saved, but printing failed. Use Reprint kitchen docket.',
+              );
+            }
+          } else {
+            toast.message(
+              'Order saved. Allow pop-ups to print the kitchen docket.',
+            );
+          }
         } else if (latest?.status === 'failed') {
+          // Keep the existing failed-status branch.
+          printWindow?.close();
+
           toast.error(
             latest.error ??
               'The server rejected the order. Review the offline queue.',
           );
         } else if (latest?.status === 'queued') {
+          // Keep the existing queued-status branch.
+          printWindow?.close();
+
           toast.message(
             'Order remains queued until synchronization succeeds',
           );
         } else {
+          // Keep the existing unknown-status branch.
+          printWindow?.close();
+
           toast.message(
             'Synchronization finished, but the status of this order could not be confirmed. Check the order queue.',
           );
         }
       } catch (error) {
+        // Synchronization failed; do not leave an empty print window.
+        printWindow?.close();
+
         await refreshOfflineOrders();
 
         toast.error(
@@ -402,6 +487,9 @@ const { data: cat, isError: menuError } = useQuery<any>({
         setIsSyncing(false);
       }
     } catch (error) {
+      // Close the print window if saving/submission fails.
+      printWindow?.close();
+
       toast.error(
         error instanceof Error
           ? error.message
@@ -410,6 +498,40 @@ const { data: cat, isError: menuError } = useQuery<any>({
     } finally {
       setSubmittingOrder(false);
     }
+  };
+
+  // --------------------------------------------------
+  // Reprint the last successfully synchronized order
+  // --------------------------------------------------
+
+  const handleReprintLastOrder = () => {
+    if (!lastSyncedOrderId) return;
+
+    // Open the window directly in the click handler.
+    const printWindow = window.open(
+      '',
+      '_blank',
+      'width=480,height=720',
+    );
+
+    if (!printWindow) {
+      toast.error('Allow pop-ups to reprint this order.');
+      return;
+    }
+
+    void fetchOrderForPrinting(lastSyncedOrderId)
+      .then((order) => {
+        printKitchenDocket(printWindow, order);
+      })
+      .catch((error) => {
+        printWindow.close();
+
+        toast.error(
+          error instanceof Error
+            ? error.message
+            : 'Could not load the order for printing.',
+        );
+      });
   };
 
   // --------------------------------------------------
@@ -511,7 +633,10 @@ const { data: cat, isError: menuError } = useQuery<any>({
             onClick={() => void handleSync()}
           >
             <RefreshCw
-              className={cn('mr-2 h-4 w-4', isSyncing && 'animate-spin')}
+              className={cn(
+                'mr-2 h-4 w-4',
+                isSyncing && 'animate-spin',
+              )}
             />
             {isSyncing ? 'Syncing…' : 'Sync now'}
           </Button>
@@ -571,30 +696,68 @@ const { data: cat, isError: menuError } = useQuery<any>({
         {/* Sales points and categories */}
 
         <div className="space-y-4">
-          <Button className="w-full" variant="default">
-            ＋ Add to Existing Order
+          <Button
+            className="w-full"
+            variant="default"
+            onClick={() => navigate('/orders')}
+          >
+            View Existing Orders
           </Button>
 
-          <Card className="p-4">
-            <div className="mb-2 font-semibold">Sales Points</div>
+                    {sp ? (
+            <Card className="flex items-center gap-3 p-4">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-blue-100 text-blue-700">
+                <Store className="h-5 w-5" />
+              </div>
 
-            <NativeSelect
-              value={sp}
-              onChange={(event) => {
-                setSp(event.target.value);
-                setCart({});
-                setCatId('');
-              }}
-            >
-              <option value="">Select Sales Point</option>
+              <div className="min-w-0 flex-1">
+                <div className="truncate font-semibold">{current?.name}</div>
+                {current?.location && (
+                  <div className="truncate text-sm text-muted-foreground">
+                    {current.location}
+                  </div>
+                )}
+              </div>
 
-              {sps?.map((salesPoint) => (
-                <option key={salesPoint.id} value={salesPoint.id}>
-                  {salesPoint.name}
-                </option>
-              ))}
-            </NativeSelect>
-          </Card>
+              <button
+                type="button"
+                className="text-xs text-blue-600 hover:underline"
+                onClick={() => {
+                  setSp('');
+                  setCart({});
+                  setCatId('');
+                }}
+              >
+                Change
+              </button>
+            </Card>
+          ) : (
+            <Card className="p-4">
+              <div className="mb-2 font-semibold">Choose a sales point</div>
+
+              <div className="space-y-1.5">
+                {sps?.map((salesPoint: any) => (
+                  <button
+                    key={salesPoint.id}
+                    type="button"
+                    className="flex w-full items-center gap-2 rounded-md border px-3 py-2 text-left text-sm hover:border-primary hover:bg-accent"
+                    onClick={() => {
+                      setSp(salesPoint.id);
+                      setCart({});
+                      setCatId('');
+                    }}
+                  >
+                    <Store className="h-4 w-4 text-slate-500" />
+                    {salesPoint.name}
+                  </button>
+                ))}
+
+                {!sps?.length && (
+                  <p className="text-xs text-muted-foreground">No sales points available.</p>
+                )}
+              </div>
+            </Card>
+          )}
 
           <Card className="p-4">
             <div className="grid grid-cols-3 gap-2">
@@ -668,6 +831,13 @@ const { data: cat, isError: menuError } = useQuery<any>({
               : 'Select a Category'}{' '}
             {catId ? 'Items' : ''}
           </div>
+
+          {menuError && (
+            <p className="mb-3 rounded-md bg-red-50 p-3 text-sm text-red-700">
+              Could not load the menu for this sales point. Check your
+              connection and try again.
+            </p>
+          )}
 
           <div className="grid gap-3 sm:grid-cols-3">
             {(catId || !cat?.categories ? shown : []).map((item: any) => (
@@ -754,109 +924,169 @@ const { data: cat, isError: menuError } = useQuery<any>({
             ))
           )}
 
-          <div>
-            <div className="mb-1 text-sm font-medium">Payment Method</div>
+          {/* Guest Type */}
 
-            <NativeSelect
-              value={method}
-              onChange={(event) => setMethod(event.target.value)}
-            >
-              <option value="">Select Payment Method</option>
-              <option value="CASH">Cash</option>
-              <option value="CARD">Card</option>
-              <option value="TRANSFER">Transfer</option>
-              <option value="ROOM_CHARGE">Charge to Room</option>
-              <option value="CITY_LEDGER">City Ledger</option>
-            </NativeSelect>
-          </div>
+<div>
+  <div className="mb-1 text-sm font-medium">Guest Type</div>
 
-          {method === 'ROOM_CHARGE' && (
-            <NativeSelect
-              value={guestId}
-              onChange={(event) => setGuestId(event.target.value)}
-            >
-              <option value="">Select in-house guest</option>
+  <NativeSelect
+    value={guestType}
+    onChange={(event) => {
+      const value = event.target.value as 'WALK_IN' | 'GUEST';
 
-              {inHouse?.map((stay) => (
-                <option key={stay.id} value={stay.guestId}>
-                  {stay.room.number} — {stay.guest.firstName}{' '}
-                  {stay.guest.lastName}
-                </option>
-              ))}
-            </NativeSelect>
-          )}
+      setGuestType(value);
+      setGuestId('');
 
-          {canApprove && (
-            <div className="space-y-2 rounded-md border border-purple-100 bg-purple-50 p-3 text-sm">
-              <label className="flex items-center justify-between">
-                <span>
-                  <b className="text-purple-700">
-                    Complimentary Transaction
-                  </b>
-                  <br />
-                  <span className="text-xs text-muted-foreground">
-                    Mark this sale as complimentary
-                  </span>
-                </span>
+      if (value === 'WALK_IN' && method === 'ROOM_CHARGE') {
+        setMethod('');
+      }
+    }}
+  >
+    <option value="WALK_IN">Walk-in Guest</option>
+    <option value="GUEST">In-house Guest</option>
+  </NativeSelect>
+</div>
 
-                <Switch
-                  checked={flags.comp}
-                  onCheckedChange={(value) =>
-                    setFlags((current) => ({
-                      ...current,
-                      comp: value,
-                    }))
-                  }
-                />
-              </label>
-            </div>
-          )}
+{/* In-house Guest Selection */}
 
-          <div className="space-y-2 rounded-md border p-3 text-sm">
-            <div className="font-medium">Additional Charges</div>
+{guestType === 'GUEST' && (
+  <div>
+    <div className="mb-1 text-sm font-medium">
+      Select In-house Guest / Room
+    </div>
 
-            <label className="flex items-center justify-between">
-              VAT (7.5%)
+    <NativeSelect
+      value={guestId}
+      onChange={(event) => setGuestId(event.target.value)}
+    >
+      <option value="">Select in-house guest</option>
 
-              <Switch
-                checked={flags.vat}
-                onCheckedChange={(value) =>
-                  setFlags((current) => ({
-                    ...current,
-                    vat: value,
-                  }))
-                }
-              />
-            </label>
+      {inHouse?.map((stay) => (
+        <option key={stay.id} value={stay.guestId}>
+          {stay.room.number} — {stay.guest.firstName}{' '}
+          {stay.guest.lastName}
+        </option>
+      ))}
+    </NativeSelect>
 
-            <label className="flex items-center justify-between">
-              Service Charge (10%)
+    {!inHouse?.length && (
+      <p className="mt-1 text-xs text-muted-foreground">
+        No in-house guests are currently available.
+      </p>
+    )}
+  </div>
+)}
 
-              <Switch
-                checked={flags.sc}
-                onCheckedChange={(value) =>
-                  setFlags((current) => ({
-                    ...current,
-                    sc: value,
-                  }))
-                }
-              />
-            </label>
-          </div>
 
-          <label className="flex items-center justify-between rounded-md border border-blue-100 bg-blue-50 p-3 text-sm">
-            <b className="text-blue-700">Staff Credit (City Ledger)</b>
+{/* Payment Method */}
 
-            <Switch
-              checked={flags.staff}
-              onCheckedChange={(value) =>
-                setFlags((current) => ({
-                  ...current,
-                  staff: value,
-                }))
-              }
-            />
-          </label>
+<div>
+  <div className="mb-1 text-sm font-medium">Payment Method</div>
+
+  <NativeSelect
+    value={method}
+    onChange={(event) => {
+      const value = event.target.value;
+      setMethod(value);
+
+      if (value === 'ROOM_CHARGE') {
+        setGuestType('GUEST');
+        setGuestId('');
+      }
+    }}
+  >
+    <option value="">Select Payment Method</option>
+    <option value="CASH">Cash</option>
+    <option value="CARD">Card</option>
+    <option value="TRANSFER">Transfer</option>
+    <option
+      value="ROOM_CHARGE"
+      disabled={guestType !== 'GUEST'}
+    >
+      Charge to Room
+    </option>
+    <option value="CITY_LEDGER">City Ledger</option>
+  </NativeSelect>
+</div>
+
+{/* Complimentary Transaction */}
+
+{canApprove && (
+  <div className="space-y-2 rounded-md border border-purple-100 bg-purple-50 p-3 text-sm">
+    <label className="flex items-center justify-between">
+      <span>
+        <b className="text-purple-700">
+          Complimentary Transaction
+        </b>
+        <br />
+        <span className="text-xs text-muted-foreground">
+          Mark this sale as complimentary
+        </span>
+      </span>
+
+      <Switch
+        checked={flags.comp}
+        onCheckedChange={(value) =>
+          setFlags((current) => ({
+            ...current,
+            comp: value,
+          }))
+        }
+      />
+    </label>
+  </div>
+)}
+
+{/* Additional Charges */}
+
+<div className="space-y-2 rounded-md border p-3 text-sm">
+  <div className="font-medium">Additional Charges</div>
+
+  <label className="flex items-center justify-between">
+    VAT (7.5%)
+
+    <Switch
+      checked={flags.vat}
+      onCheckedChange={(value) =>
+        setFlags((current) => ({
+          ...current,
+          vat: value,
+        }))
+      }
+    />
+  </label>
+
+  <label className="flex items-center justify-between">
+    Service Charge (10%)
+
+    <Switch
+      checked={flags.sc}
+      onCheckedChange={(value) =>
+        setFlags((current) => ({
+          ...current,
+          sc: value,
+        }))
+      }
+    />
+  </label>
+</div>
+
+{/* Staff Credit */}
+
+<label className="flex items-center justify-between rounded-md border border-blue-100 bg-blue-50 p-3 text-sm">
+  <b className="text-blue-700">Staff Credit (City Ledger)</b>
+
+  <Switch
+    checked={flags.staff}
+    onCheckedChange={(value) =>
+      setFlags((current) => ({
+        ...current,
+        staff: value,
+      }))
+    }
+  />
+</label>
+
 
           <div className="space-y-1 border-t pt-3 text-sm">
             <div className="flex justify-between">
@@ -896,24 +1126,42 @@ const { data: cat, isError: menuError } = useQuery<any>({
             />
           )}
 
-          {/* Corrected Complete Sale button */}
-          <Button
-            className="w-full"
-            disabled={
-              !lines.length ||
-              !method ||
-              submittingOrder ||
-              (needsNote && note.trim().length < 3) ||
-              (method === 'ROOM_CHARGE' && !guestId)
-            }
-            onClick={() => void submitOrder()}
-          >
-            {submittingOrder
-              ? 'Saving order…'
-              : flags.staff
-                ? 'Charge to ledger'
-                : 'Complete sale'}
-          </Button>
+          {/* Complete sale */}
+
+       <Button
+  className="w-full"
+  disabled={
+  !lines.length ||
+  !method ||
+  !sp ||
+  submittingOrder ||
+  (guestType === 'GUEST' && !guestId) ||
+  (method === 'ROOM_CHARGE' &&
+    (guestType !== 'GUEST' || !guestId)) ||
+  (needsNote && note.trim().length < 3)
+}
+  onClick={() => void submitOrder()}
+>
+  {submittingOrder
+    ? 'Saving order…'
+    : flags.staff
+      ? 'Create Staff Credit Order'
+      : method === 'CITY_LEDGER'
+        ? 'Create City Ledger Order'
+        : 'Send Order to Kitchen'}
+</Button>
+          {/* Reprint last successfully synchronized order */}
+
+          {lastSyncedOrderId && (
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full"
+              onClick={handleReprintLastOrder}
+            >
+              Reprint kitchen docket
+            </Button>
+          )}
 
           {!isOnline && (
             <p className="text-xs text-amber-700">

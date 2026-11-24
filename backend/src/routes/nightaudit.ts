@@ -22,6 +22,23 @@ shiftsRouter.get('/current', cashier, asyncHandler(async (req, res) => {
   const s = await prisma.shiftSession.findFirst({ where: { cashierId: req.user!.id, status: 'OPEN' } });
   res.json(s ? { id: s.id, name: s.name, date: s.date, openedAt: s.openedAt, openingFloat: n(s.openingFloat) } : null);
 }));
+/** Every shift that is open right now (for the dashboard banner), whoever opened it. */
+shiftsRouter.get('/open', cashier, asyncHandler(async (_req, res) => {
+  const rows = await prisma.shiftSession.findMany({
+    where: { status: 'OPEN' },
+    include: { cashier: { select: { fullName: true, username: true } } },
+    orderBy: { openedAt: 'asc' },
+  });
+
+  res.json(
+    rows.map((s) => ({
+      id: s.id,
+      name: s.name,
+      openedAt: s.openedAt,
+      cashier: s.cashier?.fullName ?? s.cashier?.username ?? null,
+    })),
+  );
+}));
 
 shiftsRouter.post('/open', cashier, asyncHandler(async (req, res) => {
   const b = parse(z.object({ openingFloat: z.coerce.number().min(0).max(100_000_000) }), req.body);

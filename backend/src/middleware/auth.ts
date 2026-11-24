@@ -33,7 +33,7 @@ export const authenticate = async (req: Request, _res: Response, next: NextFunct
   }
 };
 
-/** ADMIN always passes. */
+/** ADMIN and MANAGER have elevated access. */
 export const requireRole =
   (...roles: UserRole[]) =>
   (req: Request, _res: Response, next: NextFunction) => {

@@ -97,9 +97,10 @@ export default function StaffChat() {
       if (stopped) return;
       const token = tokenStore.get();
       if (!token) return;
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      socket = new WebSocket(`${protocol}//${window.location.host}/ws/staff-chat`);
-      socketRef.current = socket;
+     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+const socketUrl = `${protocol}//${window.location.host}/ws/chat`;
+
+socket = new WebSocket(socketUrl);
       socket.onopen = () => socket?.send(JSON.stringify({ type: 'auth', token }));
       socket.onmessage = (event) => {
         let data: SocketEvent;

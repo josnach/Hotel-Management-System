@@ -1,0 +1,18 @@
+-- CreateEnum
+CREATE TYPE "FacilityType" AS ENUM ('CONFERENCE_HALL', 'SWIMMING_POOL', 'RESTAURANT', 'GARDEN', 'BALLROOM', 'MEETING_ROOM', 'OTHER');
+
+-- CreateEnum
+CREATE TYPE "EventType" AS ENUM ('WEDDING', 'CONFERENCE', 'PARTY', 'BUSINESS_MEETING', 'SEMINAR', 'BANQUET', 'OTHER');
+
+-- AlterEnum
+ALTER TYPE "EventClientType" ADD VALUE 'ORGANIZATION';
+
+-- AlterTable
+ALTER TABLE "EventClient" ADD COLUMN     "taxId" TEXT;
+
+-- AlterTable
+ALTER TABLE "Facility" ADD COLUMN     "baseRate" DECIMAL(14,2),
+ADD COLUMN     "description" TEXT,
+ADD COLUMN     "features" TEXT[] DEFAULT ARRAY[]::TEXT[],
+ADD COLUMN     "isActive" BOOLEAN NOT NULL DEFAULT true,
+ADD COLUMN     "type" "FacilityType" NOT NULL DEFAULT 'CONFERENCE_HALL';

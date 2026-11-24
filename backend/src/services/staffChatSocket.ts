@@ -1,4 +1,4 @@
-import type { Server } from 'node:http';
+
 import { WebSocket, WebSocketServer } from 'ws';
 
 import { verifyAccessToken } from '../lib/session';
@@ -14,9 +14,15 @@ type AuthMessage = {
   token?: string;
 };
 
-const socketsByUser = new Map<string, Set<SocketWithUser>>();
+const socketsByUser = new Map<
+  string,
+  Set<SocketWithUser>
+>();
 
-function send(socket: WebSocket, payload: unknown): void {
+function send(
+  socket: WebSocket,
+  payload: unknown,
+): void {
   if (socket.readyState !== WebSocket.OPEN) return;
 
   socket.send(JSON.stringify(payload), (error) => {
@@ -49,6 +55,9 @@ function removeSocket(socket: SocketWithUser): void {
   socket.authenticated = false;
 }
 
+/**
+ * Publish a chat event to one authenticated staff member.
+ */
 export function publishChatEvent(
   userId: string,
   payload: unknown,
@@ -68,6 +77,9 @@ export function publishChatEvent(
   }
 }
 
+/**
+ * Publish a chat event to multiple authenticated staff members.
+ */
 export function publishChatEventToMany(
   userIds: string[],
   payload: unknown,
@@ -77,18 +89,37 @@ export function publishChatEventToMany(
   }
 }
 
-export function attachStaffChatSocket(server: Server) {
+/**
+ * Create the staff chat WebSocket server.
+ *
+ * HTTP upgrade routing is handled centrally in index.ts.
+ *
+ * Endpoint: /ws/chat
+ *
+ * Clients must send this as their first message:
+ * { type: 'auth', token: '<JWT>' }
+ */
+export function createStaffChatSocket() {
   const wss = new WebSocketServer({
-    server,
-    path: '/ws/staff-chat',
+    noServer: true,
     maxPayload: 8 * 1024,
   });
 
   wss.on('connection', (rawSocket) => {
     const socket = rawSocket as SocketWithUser;
 
+    socket.authenticated = false;
+    socket.authenticating = false;
+
+    console.log('[Staff Chat WS] New connection received');
+
+    // Require authentication within ten seconds.
     const authTimeout = setTimeout(() => {
       if (!socket.authenticated) {
+        console.warn(
+          '[Staff Chat WS] Authentication timeout',
+        );
+
         socket.close(4401, 'Authentication required');
       }
     }, 10_000);
@@ -99,7 +130,9 @@ export function attachStaffChatSocket(server: Server) {
       let message: AuthMessage;
 
       try {
-        message = JSON.parse(raw.toString()) as AuthMessage;
+        message = JSON.parse(
+          raw.toString(),
+        ) as AuthMessage;
       } catch {
         socket.close(4400, 'Invalid message');
         return;
@@ -111,12 +144,17 @@ export function attachStaffChatSocket(server: Server) {
           type: 'error',
           message: 'Unsupported socket command',
         });
+
         return;
       }
 
       // Prevent concurrent authentication attempts.
       if (socket.authenticating) {
-        socket.close(4401, 'Authentication already in progress');
+        socket.close(
+          4401,
+          'Authentication already in progress',
+        );
+
         return;
       }
 
@@ -132,16 +170,27 @@ export function attachStaffChatSocket(server: Server) {
       socket.authenticating = true;
 
       try {
-        const { user } = await verifyAccessToken(message.token);
+        const { user } = await verifyAccessToken(
+          message.token,
+        );
 
-        // The connection may have closed while authentication was pending.
-        if (socket.readyState !== WebSocket.OPEN) return;
+        // The connection may have closed while authentication
+        // was waiting for the session/database lookup.
+        if (socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
 
         socket.staffUserId = user.id;
         socket.authenticated = true;
 
+        console.log(
+          '[Staff Chat WS] Staff authenticated:',
+          user.id,
+        );
+
         const sockets =
-          socketsByUser.get(user.id) ?? new Set<SocketWithUser>();
+          socketsByUser.get(user.id) ??
+          new Set<SocketWithUser>();
 
         sockets.add(socket);
         socketsByUser.set(user.id, sockets);
@@ -151,23 +200,41 @@ export function attachStaffChatSocket(server: Server) {
         send(socket, {
           type: 'authenticated',
         });
-      } catch {
+      } catch (error) {
+        console.error(
+          '[Staff Chat WS] Authentication failed:',
+          error,
+        );
+
         clearTimeout(authTimeout);
 
         if (socket.readyState === WebSocket.OPEN) {
-          socket.close(4401, 'Invalid or expired token');
+          socket.close(
+            4401,
+            'Invalid or expired token',
+          );
         }
       } finally {
         socket.authenticating = false;
       }
     });
 
-    socket.on('close', () => {
+    socket.on('close', (code, reason) => {
+      console.log('[Staff Chat WS] Client disconnected:', {
+        code,
+        reason: reason.toString(),
+      });
+
       clearTimeout(authTimeout);
       removeSocket(socket);
     });
 
-    socket.on('error', () => {
+    socket.on('error', (error) => {
+      console.error(
+        '[Staff Chat WS] Socket error:',
+        error,
+      );
+
       clearTimeout(authTimeout);
       removeSocket(socket);
     });

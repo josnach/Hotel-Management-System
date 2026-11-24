@@ -11,6 +11,9 @@ import { createTask } from './housekeeping';
 import { checkCredit } from './receivables';
 import { assertNotBlacklisted } from './crm';
 import { newPin } from './portal';
+import { notifyRoles } from './staffNotifications';
+import { createHash } from 'node:crypto';
+import { createLedgerEntry } from './cityLedger';
 
 import {
   nightsBetween,
@@ -58,13 +61,22 @@ export interface CheckInInput {
   advancePayment: number;
   paymentMethod?: PaymentMethod;
   specialRequests?: string;
+    registrationDetails?: {
+    placeOfIssue?: string;
+    purposeOfVisit?: string;
+    vehicleRegistration?: string;
+    emergencyContactName?: string;
+    emergencyContactPhone?: string;
+    emergencyContactRelationship?: string;
+  };
 }
 
 export async function checkIn(input: CheckInInput, userId: string, role?: string) {
   const maxDiscount = canApprove(role) ? 100 : await getMaxDiscountPercent();
-  
-return prisma.$transaction(async (tx) => {
+
+  const result = await prisma.$transaction(async (tx) => {
   // Must use the same lock key as reservation creation.
+// Must use the same lock key as reservation creation.
 await tx.$queryRaw`
   SELECT pg_advisory_xact_lock(
     hashtext(${input.roomId})::bigint
@@ -81,20 +93,46 @@ await tx.$queryRaw`
       throw new HttpError(409, `Room ${room.number} is ${room.status.toLowerCase()} and cannot be assigned`);
     if (input.discountType !== 'NONE' && !input.discountReason) throw new HttpError(400, 'A discount reason is required');
     if (input.isComplimentary && !input.complimentaryReason) throw new HttpError(400, 'A reason is required for complimentary stays');
-  
+
 if (input.expectedDeparture <= new Date()) {
   throw new HttpError(400, 'Departure must be in the future');
 }
 
 const now = new Date();
 
-let linkedReservation = null as Awaited<
-  ReturnType<typeof tx.reservation.findUnique>
->;
+type LinkedReservation = Prisma.ReservationGetPayload<{
+  include: {
+    payments: {
+      select: {
+        id: true;
+        amount: true;
+        description: true;
+        method: true;
+        transferredAt: true;
+      };
+    };
+  };
+}>;
+
+let linkedReservation: LinkedReservation | null = null;
 
 if (input.reservationId) {
   linkedReservation = await tx.reservation.findUnique({
     where: { id: input.reservationId },
+    include: {
+      payments: {
+        select: {
+          id: true,
+          amount: true,
+          description: true,
+          method: true,
+          transferredAt: true,
+        },
+        orderBy: {
+          createdAt: 'asc',
+        },
+      },
+    },
   });
 
   if (!linkedReservation) {
@@ -131,7 +169,6 @@ if (input.reservationId) {
       'This reservation has passed its departure date.',
     );
   }
-
   if (
     input.guestId &&
     input.guestId !== linkedReservation.guestId
@@ -241,6 +278,12 @@ if (!guestId) {
         discountType: input.discountType, discountValue: input.discountValue, discountReason: input.discountReason,
         isComplimentary: input.isComplimentary, complimentaryReason: input.complimentaryReason, authorizedBy: input.authorizedBy,
         applyVat: input.applyVat, applyServiceCharge: input.applyServiceCharge, specialRequests: input.specialRequests,
+            placeOfIssue: input.registrationDetails?.placeOfIssue || null,
+    purposeOfVisit: input.registrationDetails?.purposeOfVisit || null,
+    vehicleRegistration: input.registrationDetails?.vehicleRegistration || null,
+    emergencyContactName: input.registrationDetails?.emergencyContactName || null,
+    emergencyContactPhone: input.registrationDetails?.emergencyContactPhone || null,
+    emergencyContactRelationship: input.registrationDetails?.emergencyContactRelationship || null,
         portalPin: newPin(), // lets the guest unlock the room QR page
       },
     });
@@ -250,10 +293,106 @@ if (!guestId) {
     data: { status: 'CHECKED_IN' },
   });
 }
-    const folio = await tx.folio.create({
-      data: { folioNo: newFolioNo(), stayId: stay.id, guestId, groupId: input.groupId },
-    });
-    const grp = !!input.groupId;
+   const folio = await tx.folio.create({
+  data: {
+    folioNo: newFolioNo(),
+    stayId: stay.id,
+    guestId,
+    groupId: input.groupId,
+    reservationId: linkedReservation?.id,
+  },
+});
+
+const grp = !!input.groupId;
+// Transfer reservation deposits into the guest folio.
+// Each payment retains its original payment method.
+// All transfer markers and folio postings are committed atomically.
+if (linkedReservation) {
+  const recordedMethod =
+    linkedReservation.paymentMethod === 'CASH' ||
+    linkedReservation.paymentMethod === 'CARD' ||
+    linkedReservation.paymentMethod === 'TRANSFER'
+      ? linkedReservation.paymentMethod
+      : undefined;
+
+  const fallbackMethod =
+    recordedMethod ??
+    (
+      input.paymentMethod === 'CASH' ||
+      input.paymentMethod === 'CARD' ||
+      input.paymentMethod === 'TRANSFER'
+        ? input.paymentMethod
+        : undefined
+    );
+
+  if (linkedReservation.payments.length > 0) {
+    for (const payment of linkedReservation.payments) {
+      if (payment.transferredAt) {
+        continue;
+      }
+
+      const method = payment.method ?? fallbackMethod;
+
+      if (!method) {
+        throw new HttpError(
+          400,
+          `Reservation deposit #${payment.id} has no recorded payment method. Select the actual payment method before checking in.`,
+        );
+      }
+
+      // Claim this deposit for transfer. The transaction rolls back
+      // if the folio posting fails.
+      const claimed = await tx.reservationPayment.updateMany({
+        where: {
+          id: payment.id,
+          reservationId: linkedReservation.id,
+          transferredAt: null,
+        },
+        data: {
+          transferredAt: new Date(),
+        },
+      });
+
+      if (claimed.count !== 1) {
+        continue;
+      }
+
+      await postFolioPayment(tx, {
+        folioId: folio.id,
+        amount: payment.amount,
+        method,
+        description: `Transferred reservation deposit: ${payment.description}`,
+        userId,
+        groupFolio: grp,
+        reference: `RESERVATION:${linkedReservation.id}:PAYMENT:${payment.id}`,
+      });
+    }
+  } else {
+    // Backward compatibility for old reservations that have a deposit
+    // amount but no ReservationPayment records.
+    const legacyDeposit = D(linkedReservation.deposit);
+
+    if (legacyDeposit.gt(0)) {
+      if (!fallbackMethod) {
+        throw new HttpError(
+          400,
+          'This reservation has an existing deposit but no recorded payment method. Select the actual payment method before checking in.',
+        );
+      }
+
+      await postFolioPayment(tx, {
+        folioId: folio.id,
+        amount: legacyDeposit,
+        method: fallbackMethod,
+        description: 'Transferred legacy reservation deposit',
+        userId,
+        groupFolio: grp,
+        reference: `RESERVATION:${linkedReservation.id}:LEGACY_DEPOSIT`,
+      });
+    }
+  }
+}
+
     const ref = `STAY:${stay.id}`;
 
     if (input.isComplimentary) {
@@ -276,11 +415,26 @@ if (!guestId) {
       room: room.number, nights, nightlyRate: Number(rate), discountType: input.discountType, discountValue: input.discountValue,
       complimentary: input.isComplimentary, authorizedBy: input.authorizedBy ?? null, advancePayment: input.advancePayment,
     } });
-     return { stay, folio };
+    return { stay, folio, roomNumber: room.number };
   }, {
     maxWait: 10_000,
     timeout: 15_000,
   });
+
+  void notifyRoles(
+    ['ADMIN', 'MANAGER'],
+    {
+      title: 'Guest checked in',
+      body: `A guest was checked in to room ${result.roomNumber}.`,
+      category: 'FRONT_DESK',
+      entityType: 'Stay',
+      entityId: result.stay.id,
+      createdByUserId: userId,
+    },
+    userId, // don't notify the person who did it
+  );
+
+  return { stay: result.stay, folio: result.folio };
 }
 async function chargeRoom(
   tx: Tx, folioId: string, roomNo: string,
@@ -292,64 +446,202 @@ async function chargeRoom(
   await postFolioCharge(tx, { ...base, description: `VAT (7.5%) on room charge for ${roomNo}`, amount: price.vat, creditCode: ACC.VAT_PAYABLE });
 }
 
-export async function extendStay(stayId: string, nights: number, userId: string | undefined, auto = false) {
-
-return prisma.$transaction(async (tx) => {
-  // Find the room so we can acquire its shared allocation lock.
-  const initialStay = await tx.stay.findUnique({
-    where: { id: stayId },
-    select: { roomId: true },
-  });
-
-  if (!initialStay) {
-    throw new HttpError(404, 'Active stay not found');
+export async function extendStay(
+  stayId: string,
+  nights: number,
+  userId: string | undefined,
+  auto = false,
+  idempotencyKey?: string,
+) {
+  // Automatic extensions retain their existing behaviour.
+  // Every manual extension must carry a stable key for safe retries.
+  if (!auto && !idempotencyKey) {
+    throw new HttpError(400, 'An Idempotency-Key header is required');
   }
 
-await tx.$queryRaw`
-  SELECT pg_advisory_xact_lock(
-    hashtext(${initialStay.roomId})::bigint
-  )::text AS lock_result
-`;
+  const requestHash = !auto
+    ? createHash('sha256')
+        .update(JSON.stringify({
+          stayId,
+          nights,
+          userId: userId ?? null,
+        }))
+        .digest('hex')
+    : undefined;
 
-  // Re-read after acquiring the lock.
-  const stay = await tx.stay.findUnique({
-    where: { id: stayId },
-    include: { room: true, folio: true },
-  });
+  return prisma.$transaction(async (tx) => {
+  // Serialize manual requests using the same idempotency key.
+  if (!auto && idempotencyKey) {
+    await tx.$queryRaw<{ locked: number }[]>`
+      WITH acquired AS MATERIALIZED (
+        SELECT pg_advisory_xact_lock(
+          hashtext(${`stay-extension:${idempotencyKey}`})::bigint
+        )
+      )
+      SELECT 1::int AS locked
+      FROM acquired
+    `;
 
-    if (!stay || stay.status !== 'CHECKED_IN' || !stay.folio) throw new HttpError(404, 'Active stay not found');
-    const price = priceStay({
-      rate: stay.nightlyRate, nights, discountType: stay.discountType, discountValue: stay.discountType === 'PERCENTAGE' ? stay.discountValue : D(0),
-      complimentary: stay.isComplimentary, vat: stay.applyVat, service: stay.applyServiceCharge,
+    // Check globally so the same key cannot be reused for another stay.
+    const previous = await tx.auditLog.findFirst({
+      where: {
+        action: 'EXTEND',
+        entity: 'Stay',
+        meta: {
+          path: ['idempotencyKey'],
+          equals: idempotencyKey,
+        },
+      },
     });
+
+    if (previous) {
+      const saved = previous.meta as Record<string, unknown>;
+
+      if (saved.requestHash !== requestHash) {
+        throw new HttpError(
+          409,
+          'This Idempotency-Key has already been used for a different extension request.',
+        );
+      }
+
+      if (
+        typeof saved.expectedDeparture !== 'string' ||
+        typeof saved.charged !== 'string'
+      ) {
+        throw new HttpError(
+          500,
+          'The previous extension request has incomplete saved results.',
+        );
+      }
+
+      // Return the original result without creating another extension.
+      return {
+        expectedDeparture: new Date(saved.expectedDeparture),
+        charged: D(saved.charged),
+      };
+    }
+  }
+
+  // Find the room so we can acquire its shared allocation lock.
+
+    // Find the room so we can acquire its shared allocation lock.
+    const initialStay = await tx.stay.findUnique({
+      where: { id: stayId },
+      select: { roomId: true },
+    });
+
+    if (!initialStay) {
+      throw new HttpError(404, 'Active stay not found');
+    }
+// Preserve the existing room-level allocation lock.
+await tx.$queryRaw<{ locked: number }[]>`
+  WITH acquired AS MATERIALIZED (
+    SELECT pg_advisory_xact_lock(
+      hashtext(${initialStay.roomId})::bigint
+    )
+  )
+  SELECT 1::int AS locked
+  FROM acquired
+`;
+    // Re-read after acquiring the room lock.
+    const stay = await tx.stay.findUnique({
+      where: { id: stayId },
+      include: { room: true, folio: true },
+    });
+
+    if (!stay || stay.status !== 'CHECKED_IN' || !stay.folio) {
+      throw new HttpError(404, 'Active stay not found');
+    }
+
+    const price = priceStay({
+      rate: stay.nightlyRate,
+      nights,
+      discountType: stay.discountType,
+      discountValue:
+        stay.discountType === 'PERCENTAGE'
+          ? stay.discountValue
+          : D(0),
+      complimentary: stay.isComplimentary,
+      vat: stay.applyVat,
+      service: stay.applyServiceCharge,
+    });
+
     const grp = !!stay.groupId;
-    if (!stay.isComplimentary) await chargeRoom(tx, stay.folio.id, stay.room.number, price, grp, userId, `STAY:${stay.id}`);
-   const next = standardCheckout(stay.expectedDeparture, nights);
 
-const reservationClash = await tx.reservation.findFirst({
-  where: {
-    roomId: stay.roomId,
-    status: { in: ['PENDING', 'CONFIRMED'] },
-    arrival: { lt: next },
-    departure: { gt: stay.expectedDeparture },
-    ...(stay.reservationId
-      ? { id: { not: stay.reservationId } }
-      : {}),
-  },
-  select: { id: true },
-});
+    if (!stay.isComplimentary) {
+      await chargeRoom(
+        tx,
+        stay.folio.id,
+        stay.room.number,
+        price,
+        grp,
+        userId,
+        `STAY:${stay.id}`,
+      );
+    }
 
-if (reservationClash) {
-  throw new HttpError(
-    409,
-    'This stay cannot be extended because the room has a reservation during the extension period.',
-  );
-}
+    const next = standardCheckout(stay.expectedDeparture, nights);
 
-    await tx.stay.update({ where: { id: stayId }, data: { expectedDeparture: next } });
-    await tx.stayExtension.create({ data: { stayId, nights, amount: price.total, auto, userId } });
-    await tx.auditLog.create({ data: { userId, action: auto ? 'AUTO_EXTEND' : 'EXTEND', entity: 'Stay', entityId: stayId, meta: { nights } } });
-    return { expectedDeparture: next, charged: price.total };
+    const reservationClash = await tx.reservation.findFirst({
+      where: {
+        roomId: stay.roomId,
+        status: { in: ['PENDING', 'CONFIRMED'] },
+        arrival: { lt: next },
+        departure: { gt: stay.expectedDeparture },
+        ...(stay.reservationId
+          ? { id: { not: stay.reservationId } }
+          : {}),
+      },
+      select: { id: true },
+    });
+
+    if (reservationClash) {
+      throw new HttpError(
+        409,
+        'This stay cannot be extended because the room has a reservation during the extension period.',
+      );
+    }
+
+    await tx.stay.update({
+      where: { id: stayId },
+      data: { expectedDeparture: next },
+    });
+
+    await tx.stayExtension.create({
+      data: {
+        stayId,
+        nights,
+        amount: price.total,
+        auto,
+        userId,
+      },
+    });
+
+    await tx.auditLog.create({
+      data: {
+        userId,
+        action: auto ? 'AUTO_EXTEND' : 'EXTEND',
+        entity: 'Stay',
+        entityId: stayId,
+        meta: auto
+          ? { nights }
+          : {
+              nights,
+              idempotencyKey,
+              requestHash,
+              expectedDeparture: next.toISOString(),
+              charged: price.total.toString(),
+            },
+      },
+    });
+
+    return {
+      expectedDeparture: next,
+      charged: price.total,
+    };
+  }, {
+    maxWait: 10000,
+    timeout: 30000,
   });
 }
 
@@ -360,9 +652,8 @@ export const standardCheckout = (d: Date, offsetDays = 0) => {
   x.setDate(x.getDate() + offsetDays);
   return x;
 };
-
 export async function checkOut(stayId: string, userId: string, pay?: { amount: number; method: PaymentMethod }, moveToCityLedger = false) {
-  return prisma.$transaction(async (tx) => {
+  const result = await prisma.$transaction(async (tx) => {
     const stay = await tx.stay.findUnique({ where: { id: stayId }, include: { folio: true, room: true } });
     if (!stay || stay.status !== 'CHECKED_IN' || !stay.folio) throw new HttpError(404, 'Active stay not found');
     if (pay && pay.amount > 0)
@@ -372,11 +663,49 @@ export async function checkOut(stayId: string, userId: string, pay?: { amount: n
       throw new HttpError(409, `Outstanding balance of ₦${bal.toFixed(2)} must be settled before checkout`);
     await tx.stay.update({ where: { id: stayId }, data: { status: 'CHECKED_OUT', checkOutAt: new Date() } });
     await tx.folio.update({ where: { id: stay.folio.id }, data: { status: bal.lte(0) ? 'SETTLED' : 'CHECKED_OUT' } });
+     // Individual guests only: a company stay is already on the group's account.
+    if (moveToCityLedger && !stay.groupId && !bal.equals(0)) {
+      await createLedgerEntry(tx, {
+        guestId: stay.guestId,
+        stayId: stay.id,
+        folioId: stay.folio.id,
+        type: bal.gt(0) ? 'DEBIT' : 'CREDIT',
+        amount: bal.abs(),
+        description: bal.gt(0)
+          ? 'Outstanding balance moved to city ledger'
+          : 'Credit balance moved to city ledger',
+        userId,
+      });
+    }
     await tx.room.update({ where: { id: stay.roomId }, data: { status: 'CLEANING' } });
-    await createTask(tx, stay.roomId, 'CHECKOUT_CLEAN'); // the housekeeping board picks it up from here
+    const task = await createTask(tx, stay.roomId, 'CHECKOUT_CLEAN'); // the housekeeping board picks it up from here
     await audit(tx, { userId, action: 'CHECK_OUT', entity: 'Stay', entityId: stayId, meta: { balance: Number(bal), movedToCityLedger: moveToCityLedger } });
-    return { balance: bal };
+    return { balance: bal, roomNumber: stay.room.number, roomId: stay.roomId, taskCreated: !!task };
   });
+
+  if (result.taskCreated) {
+    void notifyRoles(['HOUSEKEEPING'], {
+      title: 'Room needs cleaning',
+      body: `Room ${result.roomNumber} was checked out and is ready for cleaning.`,
+      category: 'HOUSEKEEPING',
+      entityType: 'Room',
+      entityId: result.roomId,
+      createdByUserId: userId,
+    });
+  }
+
+  if (moveToCityLedger && result.balance.gt(0)) {
+    void notifyRoles(['ACCOUNTANT'], {
+      title: 'Balance moved to city ledger',
+      body: `Room ${result.roomNumber} checked out with ₦${result.balance.toFixed(2)} moved to the city ledger.`,
+      category: 'ACCOUNTS',
+      entityType: 'Stay',
+      entityId: stayId,
+      createdByUserId: userId,
+    });
+  }
+
+  return { balance: result.balance };
 }
 
 /** Extends every checked-in guest whose departure has passed. Runs daily at 14:00. */
@@ -398,5 +727,13 @@ export async function runAutoExtension(userId?: string, ip?: string, action = 'A
     }
   }
   await prisma.autoExtensionLog.create({ data: { action, userId, ip, count, revenue } });
+    if (count > 0) {
+    void notifyRoles(['ADMIN', 'MANAGER', 'RECEPTIONIST'], {
+      title: 'Guests auto-extended',
+      body: `${count} guest(s) past checkout were extended (₦${Number(revenue).toLocaleString()} charged).`,
+      category: 'FRONT_DESK',
+      createdByUserId: userId ?? null,
+    });
+  }
   return { count, revenue };
 }

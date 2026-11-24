@@ -11,6 +11,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { CheckoutDialog } from './InHouse';
 import { GuestCrmCard } from '@/components/GuestCrmCard';
+import { useAuth } from '@/lib/auth';
 
 export default function Guests() {
   const [sp] = useSearchParams();
@@ -46,6 +47,7 @@ export default function Guests() {
 }
 
 export function GuestDetail() {
+  const { user } = useAuth();
   const { id } = useParams();
   const { data: g } = useGet(`/guests/${id}`);
   if (!g) return null;
@@ -55,7 +57,12 @@ export function GuestDetail() {
     <div className="mx-auto max-w-5xl">
       <div className="mb-4 flex items-center justify-between rounded-lg bg-gradient-to-r from-blue-600 to-indigo-600 p-5 text-white">
         <div className="flex items-center gap-3"><div className="flex h-12 w-12 items-center justify-center rounded-full bg-white/20 font-bold">{g.firstName[0]}{g.lastName[0]}</div><div><div className="text-xl font-bold">{g.firstName} {g.lastName}</div><div className="text-sm opacity-80">Guest Details</div></div></div>
-        <Button variant="secondary" asChild><Link to="/guests">Back to Guests</Link></Button>
+        <Link
+  to="/guests"
+  className="inline-flex h-9 items-center justify-center rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80"
+>
+  Back to Guests
+</Link>
       </div>
       <div className="grid gap-4 md:grid-cols-3">
         <div className="space-y-4 md:col-span-2">
@@ -68,12 +75,49 @@ export function GuestDetail() {
         <div className="space-y-4">
           <GuestCrmCard id={g.id} />
           <Card><CardHeader><CardTitle>Guest Status</CardTitle></CardHeader><CardContent className="space-y-2 text-sm"><div className="flex justify-between"><span className="text-muted-foreground">Check-in Status</span><Badge>{g.checkInStatus === 'CHECKED_IN' ? 'Checked In' : 'Checked Out'}</Badge></div><div className="flex justify-between"><span className="text-muted-foreground">Group Status</span><Badge>{g.groupStatus}</Badge></div><div className="flex justify-between"><span className="text-muted-foreground">Created</span><span>{d(g.createdAt)}</span></div></CardContent></Card>
-          <Card><CardHeader><CardTitle>Quick Actions</CardTitle></CardHeader><CardContent className="space-y-2">
-            {cur?.folio && <Button className="w-full" asChild><Link to={`/folios/${cur.folio.id}`}>View Folio</Link></Button>}
-            <PrintButton label="Print Folio" />
-            <Button variant="secondary" className="w-full bg-yellow-100 text-yellow-800">Edit Guest</Button>
-            <Button className="w-full" asChild><Link to="/reports/security">Create Security Report</Link></Button>
-          </CardContent></Card>
+        <Card>
+  <CardHeader>
+    <CardTitle>Quick Actions</CardTitle>
+  </CardHeader>
+
+  <CardContent className="space-y-2">
+    {cur?.folio && (
+      <Link
+        to={`/folios/${cur.folio.id}`}
+        className="flex h-9 w-full items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+      >
+        View Folio
+      </Link>
+    )}
+
+    <PrintButton label="Print Folio" />
+
+    <Button
+      variant="secondary"
+      className="w-full bg-yellow-100 text-yellow-800"
+    >
+      Edit Guest
+    </Button>
+
+    <Link
+      to="/reports/security"
+      className="flex h-9 w-full items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+    >
+      Create Security Report
+    </Link>
+
+    {['ADMIN', 'MANAGER', 'RECEPTIONIST', 'ACCOUNTANT'].includes(
+      user?.role ?? '',
+    ) && (
+      <Link
+        to={`/guests/${id}/history`}
+        className="flex h-9 w-full items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+      >
+        Guest History
+      </Link>
+    )}
+  </CardContent>
+</Card>
         </div>
       </div>
     </div>

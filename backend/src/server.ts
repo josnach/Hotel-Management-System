@@ -1,42 +1,129 @@
+
 import cron from 'node-cron';
+import { createServer } from 'node:http';
+
 import { app } from './app';
 import { config } from './config';
 import { prisma } from './lib/prisma';
-import { runAutoExtension } from './services/stays';
-import { startMessagingJobs } from './messaging/worker';
-import { generateStayoverTasks } from './services/housekeeping';
-import { createServer } from 'node:http';
-import { attachStaffNotificationSocket } from './services/staffNotificationsSocket';
-import { attachStaffChatSocket } from './services/staffChatSocket';
 import { purgeOldSessions } from './lib/session';
+
+import { runAutoExtension } from './services/stays';
+import { generateStayoverTasks } from './services/housekeeping';
+
+import { startMessagingJobs } from './messaging/worker';
+
+import { createStaffNotificationSocket } from './services/staffNotificationsSocket';
+import { createStaffChatSocket } from './services/staffChatSocket';
+import { notifyStaff } from './services/staffNotifications';
 
 const server = createServer(app);
 
-attachStaffNotificationSocket(server);
-attachStaffChatSocket(server);
+// Create both WebSocket servers without attaching them directly
+// to the HTTP server.
+const notificationsWss = createStaffNotificationSocket();
+const chatWss = createStaffChatSocket();
 
-server.listen(config.port, () => {
-  console.log(`HMS API listening on :${config.port}`);
-  console.log(`Staff notification WebSocket available at /ws`);
+// Centralized WebSocket upgrade routing.
+server.on('upgrade', (req, socket, head) => {
+  let pathname: string;
+
+  try {
+    pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
+  } catch (error) {
+    console.error('[WebSocket] Invalid upgrade URL:', error);
+    socket.destroy();
+    return;
+  }
+
+  if (pathname === '/ws') {
+    notificationsWss.handleUpgrade(req, socket, head, (ws) => {
+      notificationsWss.emit('connection', ws, req);
+    });
+
+    return;
+  }
+
+  if (pathname === '/ws/chat') {
+    chatWss.handleUpgrade(req, socket, head, (ws) => {
+      chatWss.emit('connection', ws, req);
+    });
+
+    return;
+  }
+
+  // Reject unknown WebSocket endpoints.
+  socket.destroy();
 });
 
-// Daily auto-extension of guests who are past checkout (default 14:00 hotel time)
-cron.schedule(config.autoExtensionCron, () => {
-  runAutoExtension().then((r) => console.log('Auto extension:', r)).catch((e) => console.error('Auto extension failed', e));
-}, { timezone: process.env.TZ ?? 'Africa/Lagos' });
+// Start HTTP server.
+server.listen(config.port, () => {
+  console.log(`HMS API listening on :${config.port}`);
+  console.log('Staff notification WebSocket available at /ws');
+  console.log('Staff chat WebSocket available at /ws/chat');
+});
 
-// 07:30 daily: light stayover cleans for rooms that stay another night
-cron.schedule(process.env.STAYOVER_CRON ?? '30 7 * * *', () => {
-  generateStayoverTasks().then((n) => console.log('Stayover tasks created:', n)).catch((e) => console.error('Stayover generation failed', e));
-}, { timezone: process.env.TZ ?? 'Africa/Lagos' });
 
-// 03:15 daily: delete sessions that expired or were revoked over 30 days ago
-cron.schedule('15 3 * * *', () => {
-  purgeOldSessions().then((r) => console.log('Old sessions purged:', r.count)).catch((e) => console.error('Session purge failed', e));
-}, { timezone: process.env.TZ ?? 'Africa/Lagos' });
+// Daily auto-extension of guests who are past checkout.
+cron.schedule(
+  config.autoExtensionCron,
+  () => {
+    runAutoExtension()
+      .then((result) => console.log('Auto extension:', result))
+      .catch((error) => console.error('Auto extension failed', error));
+  },
+  {
+    timezone: process.env.TZ ?? 'Africa/Lagos',
+  },
+);
 
+// 07:30 daily: generate light stayover cleaning tasks.
+cron.schedule(
+  process.env.STAYOVER_CRON ?? '30 7 * * *',
+  () => {
+    generateStayoverTasks()
+      .then((count) => console.log('Stayover tasks created:', count))
+      .catch((error) => console.error('Stayover generation failed', error));
+  },
+  {
+    timezone: process.env.TZ ?? 'Africa/Lagos',
+  },
+);
+
+// 03:15 daily: delete sessions that expired or were revoked
+// more than 30 days ago.
+cron.schedule(
+  '15 3 * * *',
+  () => {
+    purgeOldSessions()
+      .then((result) => console.log('Old sessions purged:', result.count))
+      .catch((error) => console.error('Session purge failed', error));
+  },
+  {
+    timezone: process.env.TZ ?? 'Africa/Lagos',
+  },
+);
+
+// Start background messaging jobs.
 startMessagingJobs();
 
-const shutdown = async () => { server.close(); await prisma.$disconnect(); process.exit(0); };
+// Graceful shutdown.
+const shutdown = async () => {
+  console.log('Shutting down HMS API...');
+
+  notificationsWss.close();
+  chatWss.close();
+
+  server.close(async () => {
+    try {
+      await prisma.$disconnect();
+      console.log('HMS API shut down successfully.');
+      process.exit(0);
+    } catch (error) {
+      console.error('Error during shutdown:', error);
+      process.exit(1);
+    }
+  });
+};
+
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

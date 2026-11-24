@@ -1,4 +1,4 @@
-import { CustomerType, PaymentMethod, Prisma } from '@prisma/client';
+import { CustomerType, OrderStatus, PaymentMethod, Prisma } from '@prisma/client';
 import { createHash } from 'node:crypto';
 
 import { canApprove } from './policy';
@@ -14,6 +14,7 @@ import {
 import { cashAccountFor, postFolioCharge } from './folio';
 import { audit } from '../lib/audit';
 import { checkCredit } from './receivables';
+import { notifyRoles } from './staffNotifications';
 
 export interface OrderInput {
   customerType: CustomerType;
@@ -140,31 +141,43 @@ if (idempotencyKey && requestHash) {
   }
 }
 
-  try {
-  return await prisma.$transaction(
+    try {
+  const created = await prisma.$transaction(
     async (tx) => {
       const sp = await tx.salesPoint.findUnique({
         where: { id: input.salesPointId },
       });
 
-      if (!sp) {
-        throw new HttpError(404, 'Sales point not found');
-      }
+      if (!sp || !sp.isActive) {
+  throw new HttpError(404, 'Active sales point not found');
+}
 
       if (!input.items.length) {
         throw new HttpError(400, 'Add at least one item');
       }
 
-      const items = await tx.inventoryItem.findMany({
-        where: {
-          id: { in: input.items.map((item) => item.itemId) },
-        },
-        include: {
-          recipeLines: {
-            include: { ingredient: true },
+     const items = await tx.inventoryItem.findMany({
+  where: {
+    id: { in: input.items.map((item) => item.itemId) },
+  },
+  include: {
+    category: true,
+    menuProduct: {
+      include: {
+        availability: {
+          where: {
+            salesPointId: input.salesPointId,
           },
         },
-      });
+      },
+    },
+    recipeLines: {
+      include: {
+        ingredient: true,
+      },
+    },
+  },
+});
 
       let subtotal = D(0);
       let cost = D(0);
@@ -178,65 +191,102 @@ if (idempotencyKey && requestHash) {
         type: 'SALE' | 'RECIPE_USE';
         stock: Prisma.Decimal;
       }[] = [];
+const lines = input.items.map((li) => {
+  const it = items.find((item) => item.id === li.itemId);
 
-      const lines = input.items.map((li) => {
-        const it = items.find((item) => item.id === li.itemId);
+  if (!it || it.salesPointId !== sp.id) {
+    throw new HttpError(
+      404,
+      'Item not found at the selected sales point',
+    );
+  }
 
-        if (!it) {
-          throw new HttpError(404, 'Item not found');
-        }
+  if (!Number.isFinite(li.quantity) || li.quantity <= 0) {
+    throw new HttpError(
+      400,
+      `Invalid quantity for ${it.name}`,
+    );
+  }
 
-        if (!Number.isFinite(li.quantity) || li.quantity <= 0) {
-          throw new HttpError(
-            400,
-            `Invalid quantity for ${it.name}`,
-          );
-        }
+  if (!it.isActive || !it.category.isActive) {
+    throw new HttpError(
+      409,
+      `${it.name} is inactive and cannot be sold`,
+    );
+  }
 
-        subtotal = subtotal.plus(
-          D(it.sellPrice).times(li.quantity),
-        );
+  const menuProduct = it.menuProduct;
 
-        let unitCost = D(it.costPrice);
+  // Keep unlinked legacy inventory sellable during the migration.
+  // Once linked, the shared product and its sales-point availability
+  // must both permit sales.
+  if (menuProduct) {
+    if (!menuProduct.isActive) {
+      throw new HttpError(
+        409,
+        `${it.name} is inactive in the central menu`,
+      );
+    }
 
-        if (it.recipeLines.length) {
-          unitCost = it.recipeLines.reduce(
-            (sum, recipeLine) =>
-              sum.plus(
-                D(recipeLine.quantity).times(
-                  recipeLine.ingredient.costPrice,
-                ),
-              ),
-            D(0),
-          );
+    const availability = menuProduct.availability[0];
 
-          for (const recipeLine of it.recipeLines) {
-            uses.push({
-              id: recipeLine.ingredientId,
-              name: recipeLine.ingredient.name,
-              qty: D(recipeLine.quantity).times(li.quantity),
-              type: 'RECIPE_USE',
-              stock: recipeLine.ingredient.quantity,
-            });
-          }
-        } else {
-          uses.push({
-            id: it.id,
-            name: it.name,
-            qty: D(li.quantity),
-            type: 'SALE',
-            stock: it.quantity,
-          });
-        }
+    if (!availability?.isAvailable) {
+      throw new HttpError(
+        409,
+        `${it.name} is unavailable at ${sp.name}`,
+      );
+    }
+  }
 
-        cost = cost.plus(unitCost.times(li.quantity));
+  // The shared menu price is authoritative for linked products.
+  // Legacy, unlinked inventory continues using its existing price.
+  const sellPrice = menuProduct?.sellPrice ?? it.sellPrice;
 
-        return {
-          it,
-          li,
-          unitCost: unitCost.toDecimalPlaces(2),
-        };
+  subtotal = subtotal.plus(
+    D(sellPrice).times(li.quantity),
+  );
+
+  let unitCost = D(it.costPrice);
+
+  if (it.recipeLines.length) {
+    unitCost = it.recipeLines.reduce(
+      (sum, recipeLine) =>
+        sum.plus(
+          D(recipeLine.quantity).times(
+            recipeLine.ingredient.costPrice,
+          ),
+        ),
+      D(0),
+    );
+
+    for (const recipeLine of it.recipeLines) {
+      uses.push({
+        id: recipeLine.ingredientId,
+        name: recipeLine.ingredient.name,
+        qty: D(recipeLine.quantity).times(li.quantity),
+        type: 'RECIPE_USE',
+        stock: recipeLine.ingredient.quantity,
       });
+    }
+  } else {
+    uses.push({
+      id: it.id,
+      name: it.name,
+      qty: D(li.quantity),
+      type: 'SALE',
+      stock: it.quantity,
+    });
+  }
+
+  cost = cost.plus(unitCost.times(li.quantity));
+
+  return {
+    it,
+    li,
+    sellPrice,
+    unitCost: unitCost.toDecimalPlaces(2),
+  };
+});
 
       // Aggregate stock requirements so the same ingredient or bottle
       // is not checked separately for each order line.
@@ -308,11 +358,16 @@ if (idempotencyKey && requestHash) {
 
       const toRoom = input.paymentMethod === 'ROOM_CHARGE';
 
-      const paymentStatus = input.isComplimentary
-        ? 'PAID'
-        : deferred
-          ? 'UNPAID'
-          : 'PAID';
+     // Creating an order does not mean payment has been received.
+//
+// Complimentary orders are settled through their complimentary
+// accounting treatment.
+// Room charges are settled against the guest's active folio.
+// All other orders remain unpaid until payment is recorded.
+const paymentStatus =
+  input.isComplimentary || toRoom
+    ? 'PAID'
+    : 'UNPAID';
 
       const order = await tx.order.create({
         data: {
@@ -334,15 +389,15 @@ if (idempotencyKey && requestHash) {
           isStaffCredit: input.isStaffCredit,
           instructions: input.instructions,
           notes: input.notes,
-          items: {
-            create: lines.map(({ it, li, unitCost }) => ({
-              itemId: it.id,
-              quantity: li.quantity,
-              unitPrice: it.sellPrice,
-              unitCost,
-              instructions: li.instructions,
-            })),
-          },
+       items: {
+        create: lines.map(({ it, li, sellPrice, unitCost }) => ({
+      itemId: it.id,
+    quantity: li.quantity,
+    unitPrice: sellPrice,
+    unitCost,
+    instructions: li.instructions,
+  })),
+},
         },
       });
 
@@ -466,9 +521,11 @@ if (idempotencyKey && requestHash) {
           creditCode: ACC.VAT_PAYABLE,
         });
       } else {
-        const debitAccount = deferred
-          ? ACC.AR_CITY
-          : cashAccountFor(input.paymentMethod);
+        // All non-room, non-complimentary orders initially create
+// a receivable. Actual payment is recorded separately through
+// payOrder(), which debits the appropriate cash/bank account
+// and credits Accounts Receivable.
+  const debitAccount = ACC.AR_CITY;
 
         await postJournal(tx, {
           description: `Payment for order ${orderNo}`,
@@ -512,13 +569,34 @@ if (idempotencyKey && requestHash) {
         ],
       });
 
-      return order;
+            return order;
     },
-          {
-        maxWait: 10000,
-        timeout: 20000,
-      },
-    );
+    {
+      maxWait: 10000,
+      timeout: 20000,
+    },
+  );
+
+  // Only runs for a newly created order, not an idempotent replay.
+  const salesPoint = await prisma.salesPoint.findUnique({
+    where: { id: created.salesPointId },
+    select: { name: true },
+  });
+
+  void notifyRoles(
+    ['CHEF'],
+    {
+      title: 'New order',
+      body: `Order ${created.orderNo} was placed at ${salesPoint?.name ?? 'a sales point'}.`,
+      category: 'ORDERS',
+      entityType: 'Order',
+      entityId: created.id,
+      createdByUserId: staffId,
+    },
+    staffId,
+  );
+
+  return created;
   } catch (error) {
     // A concurrent request may have committed this same key first.
     if (
@@ -554,6 +632,13 @@ export async function payOrder(
   method: PaymentMethod,
   userId: string,
 ) {
+  if (!['CASH', 'CARD', 'TRANSFER'].includes(method)) {
+    throw new HttpError(
+      400,
+      'Payment must be Cash, Card or Transfer',
+    );
+  }
+
   return prisma.$transaction(
     async (tx) => {
       const order = await tx.order.findUnique({
@@ -568,6 +653,40 @@ export async function payOrder(
         throw new HttpError(
           409,
           'This order is not awaiting payment',
+        );
+      }
+
+      if (
+        order.status !== 'SERVED' &&
+        order.status !== 'COMPLETED'
+      ) {
+        throw new HttpError(
+          409,
+          'An order must be served before payment can be recorded',
+        );
+      }
+
+      // Claim the unpaid order atomically. This prevents two
+      // simultaneous payment requests from posting duplicate
+      // settlement journals.
+      const claimed = await tx.order.updateMany({
+        where: {
+          id: orderId,
+          paymentStatus: 'UNPAID',
+          status: {
+            in: ['SERVED', 'COMPLETED'],
+          },
+        },
+        data: {
+          paymentStatus: 'PAID',
+          paymentMethod: method,
+        },
+      });
+
+      if (claimed.count !== 1) {
+        throw new HttpError(
+          409,
+          'This order has already been paid or its status has changed',
         );
       }
 
@@ -587,14 +706,6 @@ export async function payOrder(
         ],
       });
 
-      const paid = await tx.order.update({
-        where: { id: orderId },
-        data: {
-          paymentStatus: 'PAID',
-          paymentMethod: method,
-        },
-      });
-
       await audit(tx, {
         userId,
         action: 'PAY_ORDER',
@@ -607,7 +718,208 @@ export async function payOrder(
         },
       });
 
-      return paid;
+      return tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+      });
+    },
+    {
+      maxWait: 10000,
+      timeout: 20000,
+    },
+  );
+}
+
+export async function updateOrderStatus(
+  orderId: string,
+  status: OrderStatus,
+  userId: string,
+  role: string,
+) {
+  return prisma.$transaction(
+    async (tx) => {
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+      });
+
+      if (!order) {
+        throw new HttpError(404, 'Order not found');
+      }
+
+      if (order.paymentStatus === 'VOIDED') {
+        throw new HttpError(
+          409,
+          'This order has been voided',
+        );
+      }
+
+      const validTransitions: Record<string, OrderStatus[]> = {
+        PENDING: ['PREPARING'],
+        CONFIRMED: ['PREPARING'],
+        PREPARING: ['READY'],
+        READY: ['SERVED'],
+      };
+
+      const allowedNextStatuses =
+        validTransitions[order.status] ?? [];
+
+      if (!allowedNextStatuses.includes(status)) {
+        throw new HttpError(
+          409,
+          `Cannot move an order from ${order.status} to ${status}`,
+        );
+      }
+
+      // Kitchen staff can prepare orders and mark them ready.
+      if (
+        role === 'CHEF' &&
+        !['PREPARING', 'READY'].includes(status)
+      ) {
+        throw new HttpError(
+          403,
+          'Kitchen staff can only prepare orders and mark them ready',
+        );
+      }
+
+      // Waiters can mark ready orders as served.
+      if (role === 'WAITER' && status !== 'SERVED') {
+        throw new HttpError(
+          403,
+          'Waiters can only mark ready orders as served',
+        );
+      }
+
+      if (
+        !['WAITER', 'CHEF', 'MANAGER', 'ADMIN'].includes(role)
+      ) {
+        throw new HttpError(
+          403,
+          'You are not authorized to update this order',
+        );
+      }
+
+      // Prevent simultaneous status updates from overwriting
+      // another user's change.
+      const updatedCount = await tx.order.updateMany({
+        where: {
+          id: orderId,
+          status: order.status,
+          paymentStatus: order.paymentStatus,
+        },
+        data: { status },
+      });
+
+      if (updatedCount.count !== 1) {
+        throw new HttpError(
+          409,
+          'The order was updated by another user. Refresh and try again.',
+        );
+      }
+
+      await audit(tx, {
+        userId,
+        action: 'UPDATE_ORDER_STATUS',
+        entity: 'Order',
+        entityId: order.id,
+        meta: {
+          orderNo: order.orderNo,
+          previousStatus: order.status,
+          newStatus: status,
+        },
+      });
+
+      return tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+      });
+    },
+    {
+      maxWait: 10000,
+      timeout: 20000,
+    },
+  );
+}
+
+export async function completeOrder(
+  orderId: string,
+  userId: string,
+) {
+  return prisma.$transaction(
+    async (tx) => {
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+      });
+
+      if (!order) {
+        throw new HttpError(404, 'Order not found');
+      }
+
+      if (order.paymentStatus === 'VOIDED') {
+        throw new HttpError(
+          409,
+          'A voided order cannot be completed',
+        );
+      }
+
+      if (order.status !== 'SERVED') {
+        throw new HttpError(
+          409,
+          'Only served orders can be completed',
+        );
+      }
+
+      // These are explicitly authorized deferred-payment
+      // arrangements. They may be completed while outstanding.
+      const authorizedDeferred =
+        order.isStaffCredit ||
+        order.paymentMethod === 'STAFF_CREDIT' ||
+        order.paymentMethod === 'CITY_LEDGER';
+
+      if (
+        order.paymentStatus !== 'PAID' &&
+        !(
+          order.paymentStatus === 'UNPAID' &&
+          authorizedDeferred
+        )
+      ) {
+        throw new HttpError(
+          409,
+          'Record payment before completing this sale',
+        );
+      }
+
+      const updatedCount = await tx.order.updateMany({
+        where: {
+          id: orderId,
+          status: 'SERVED',
+          paymentStatus: order.paymentStatus,
+        },
+        data: {
+          status: 'COMPLETED',
+        },
+      });
+
+      if (updatedCount.count !== 1) {
+        throw new HttpError(
+          409,
+          'The order has already been updated. Refresh and try again.',
+        );
+      }
+
+      await audit(tx, {
+        userId,
+        action: 'COMPLETE_ORDER',
+        entity: 'Order',
+        entityId: order.id,
+        meta: {
+          orderNo: order.orderNo,
+          total: Number(order.total),
+          paymentStatus: order.paymentStatus,
+          paymentMethod: order.paymentMethod,
+        },
+      });
+
+      return tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+      });
     },
     {
       maxWait: 10000,

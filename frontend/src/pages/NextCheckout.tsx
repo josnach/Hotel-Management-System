@@ -9,12 +9,39 @@ import { Card } from '@/components/ui/card';
 import { NativeSelect } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { CheckoutDialog } from './InHouse';
+import {
+  getStayExtensionKey,
+  clearStayExtensionKey,
+} from '@/lib/stay-extension';
 
 export default function NextCheckout() {
   const [hours, setHours] = useState(14);
   const { data } = useGet('/stays/next-checkout', { hours });
   const [target, setTarget] = useState<any>(null);
-  const extend = useAction((id: string) => api.post(`/stays/${id}/extend`, { nights: 1 }), { success: 'Stay extended by 1 night', invalidate: ['/stays/next-checkout'] });
+const extend = useAction(
+  async ({
+    id,
+    idempotencyKey,
+  }: {
+    id: string;
+    idempotencyKey: string;
+  }) => {
+    const result = await api.post(
+      `/stays/${id}/extend`,
+      { nights: 1 },
+      { 'Idempotency-Key': idempotencyKey },
+    );
+
+    // Clear the key only after the server confirms success.
+    clearStayExtensionKey(id);
+
+    return result;
+  },
+  {
+    success: 'Stay extended by 1 night',
+    invalidate: ['/stays/next-checkout', '/stays/in-house'],
+  },
+);
   return (
     <>
       <PageHeader title="Guests Due for Checkout">
@@ -42,7 +69,26 @@ export default function NextCheckout() {
                 <td className="px-4 py-3">{r.overdue ? <Badge variant="red" className="bg-red-600 text-white">OVERDUE: {r.overdueDays} days</Badge> : <Badge variant="orange">{r.hoursLeft.toFixed(1)} h left</Badge>}</td>
                 <td className="px-4 py-3"><div className="flex gap-3 text-xs font-medium">
                   <button className="flex items-center gap-1 text-blue-700" onClick={() => setTarget(r)}><LogOut className="h-3.5 w-3.5" /> Check Out</button>
-                  <button className="flex items-center gap-1 text-green-700" onClick={() => extend.mutate(r.id)}><CalendarPlus className="h-3.5 w-3.5" /> Extend</button>
+                  <button
+  type="button"
+  disabled={extend.isPending}
+  className="flex items-center gap-1 text-green-700 disabled:cursor-not-allowed disabled:opacity-50"
+  onClick={() => {
+    const confirmed = window.confirm(
+      `Extend ${r.guest.firstName} ${r.guest.lastName}'s stay in Room ${r.room.number} by one night?`,
+    );
+
+    if (confirmed) {
+      extend.mutate({
+        id: r.id,
+        idempotencyKey: getStayExtensionKey(r.id),
+      });
+    }
+  }}
+>
+  <CalendarPlus className="h-3.5 w-3.5" />
+  {extend.isPending ? 'Extending...' : 'Extend'}
+</button>
                   <Link className="flex items-center gap-1 text-slate-700" to={`/guests/${r.guestId}`}><Eye className="h-3.5 w-3.5" /> View</Link>
                 </div></td>
               </tr>

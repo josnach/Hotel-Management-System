@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import { Navigate, useNavigate } from 'react-router-dom';
+import { Navigate, useNavigate, useSearchParams } from 'react-router-dom';
 import { Building2, ShieldCheck } from 'lucide-react';
 import { useAuth } from '@/lib/auth';
 import { Button } from '@/components/ui/button';
@@ -11,6 +11,8 @@ const HOTEL_NAME = 'Koraf Hotels'; // change the name here
 export default function Login() {
   const { user, login, verifyTwoFactor } = useAuth();
   const nav = useNavigate();
+  const [sp] = useSearchParams();
+const passwordChanged = sp.get('passwordChanged') === '1';
   const [id, setId] = useState('');
   const [pw, setPw] = useState('');
   const [err, setErr] = useState('');
@@ -56,6 +58,11 @@ export default function Login() {
           <div className="space-y-1.5"><Label htmlFor="id">Username or email</Label><Input id="id" autoComplete="username" value={id} onChange={(e) => setId(e.target.value)} required /></div>
           <div className="space-y-1.5"><Label htmlFor="pw">Password</Label><Input id="pw" type="password" autoComplete="current-password" value={pw} onChange={(e) => setPw(e.target.value)} required /></div>
         </>)}
+        {passwordChanged && !err && (
+  <p className="rounded-md bg-green-50 px-3 py-2 text-sm text-green-700">
+    Your password was changed. Please sign in again with your new password.
+  </p>
+)}
         {err && <p className="text-sm text-red-600">{err}</p>}
         <Button className="w-full" disabled={busy}>{busy ? (challenge ? 'Verifying…' : 'Signing in…') : (challenge ? 'Verify' : 'Sign in')}</Button>
         <p className="flex items-center justify-center gap-1 text-xs text-muted-foreground"><ShieldCheck className="h-3.5 w-3.5" /> Secure login with enterprise-grade encryption</p>

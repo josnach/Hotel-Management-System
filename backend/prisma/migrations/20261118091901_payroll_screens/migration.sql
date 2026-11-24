@@ -1,0 +1,13 @@
+-- AlterTable
+ALTER TABLE "PayrollPeriod" ADD COLUMN     "frequency" TEXT NOT NULL DEFAULT 'MONTHLY',
+ADD COLUMN     "paymentDate" TIMESTAMP(3),
+ADD COLUMN     "trackLeave" BOOLEAN NOT NULL DEFAULT false,
+ADD COLUMN     "trackTime" BOOLEAN NOT NULL DEFAULT false;
+
+-- AlterTable
+ALTER TABLE "Payslip" ADD COLUMN     "compExcess" DECIMAL(14,2) NOT NULL DEFAULT 0,
+ADD COLUMN     "meal" DECIMAL(14,2) NOT NULL DEFAULT 0,
+ADD COLUMN     "overtime" DECIMAL(14,2) NOT NULL DEFAULT 0,
+ADD COLUMN     "paidAt" TIMESTAMP(3),
+ADD COLUMN     "paymentMethod" TEXT,
+ADD COLUMN     "paymentStatus" TEXT NOT NULL DEFAULT 'PENDING';

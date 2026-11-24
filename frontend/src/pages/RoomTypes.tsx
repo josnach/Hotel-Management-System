@@ -1,43 +1,53 @@
-import { useState } from 'react';
+// src/pages/RoomTypes.tsx   (REPLACES your current list page; route "room-types")
+import { Link, useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { useAction, useGet } from '@/lib/hooks';
-import { money } from '@/lib/utils';
-import { Field, PageHeader } from '@/components/common';
-import { ListCard } from '@/components/DataTable';
-import { Button } from '@/components/ui/button';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { Input } from '@/components/ui/input';
+import { naira } from '@/lib/roomTypeFormat';
 
 export default function RoomTypes() {
-  const { data, isLoading } = useGet<any[]>('/rooms/types');
+  const nav = useNavigate();
   const { user } = useAuth();
   const canManage = user?.role === 'ADMIN' || user?.role === 'MANAGER';
-  const [edit, setEdit] = useState<any>(null);
-  const [f, setF] = useState<any>({});
-  const open = (t: any) => { setEdit(t); setF({ name: t.name ?? '', description: t.description ?? '', nightlyRate: t.nightlyRate ?? '', capacity: t.capacity ?? 2 }); };
-  const save = useAction(() => (edit.id ? api.put(`/rooms/types/${edit.id}`, f) : api.post('/rooms/types', f)), { success: 'Room type saved', invalidate: ['/rooms/types'], onSuccess: () => setEdit(null) });
+  const { data, isLoading } = useGet<any[]>('/rooms/types');
   const del = useAction((id: string) => api.del(`/rooms/types/${id}`), { success: 'Room type deleted', invalidate: ['/rooms/types'] });
+
+  function remove(t: any) {
+    const n = t._count?.rooms ?? 0;
+    if (n > 0) return alert(`Cannot delete ${t.name}: ${n} room(s) assigned`);
+    if (confirm(`Delete ${t.name}?`)) del.mutate(t.id);
+  }
+
   return (
-    <>
-      <PageHeader title="Room Types">{canManage && <Button onClick={() => open({})}>Add New Room Type</Button>}</PageHeader>
-      <ListCard rows={data} loading={isLoading} cols={[
-        { header: 'Name', cell: (t) => <div><div className="font-medium">{t.name}</div><div className="text-xs text-muted-foreground">{t.description}</div></div> },
-        { header: 'Nightly rate', cell: (t) => money(t.nightlyRate) }, { header: 'Capacity', cell: (t) => `${t.capacity} person(s)` },
-        ...(canManage ? [{ header: 'Actions', cell: (t: any) => <div className="flex gap-3 text-xs font-medium"><button className="text-blue-700" onClick={() => open(t)}>Edit</button><button className="text-red-600" onClick={() => confirm(`Delete ${t.name}?`) && del.mutate(t.id)}>Delete</button></div> }] : []),
-      ]} />
-      <Dialog open={!!edit} onOpenChange={(o) => !o && setEdit(null)}>
-        <DialogContent>
-          <DialogHeader><DialogTitle>{edit?.id ? 'Edit room type' : 'Add room type'}</DialogTitle></DialogHeader>
-          <Field label="Name"><Input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></Field>
-          <Field label="Description"><Input value={f.description} onChange={(e) => setF({ ...f, description: e.target.value })} /></Field>
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Nightly rate (₦)"><Input type="number" value={f.nightlyRate} onChange={(e) => setF({ ...f, nightlyRate: e.target.value })} /></Field>
-            <Field label="Capacity"><Input type="number" value={f.capacity} onChange={(e) => setF({ ...f, capacity: e.target.value })} /></Field>
-          </div>
-          <Button onClick={() => save.mutate(undefined)} disabled={save.isPending}>Save</Button>
-        </DialogContent>
-      </Dialog>
-    </>
+    <div className="mx-auto w-full max-w-[1520px] px-6 py-12">
+      <div className="mb-6 flex items-center justify-between">
+        <h1 className="text-2xl font-bold text-gray-900">Room Types</h1>
+        {canManage && <Link to="/room-types/new" className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">Add New Room Type</Link>}
+      </div>
+
+      <div className="overflow-hidden rounded-lg bg-white shadow-sm ring-1 ring-gray-100">
+        <table className="w-full text-left">
+          <thead className="bg-gray-50">
+            <tr>{['Name', 'Nightly Rate', 'Capacity', 'Actions'].map((h) => <th key={h} className="px-6 py-3 text-xs font-medium uppercase tracking-wide text-gray-500">{h}</th>)}</tr>
+          </thead>
+          <tbody>
+            {data?.map((t) => (
+              <tr key={t.id} className="border-t border-gray-100">
+                <td className="w-[45%] px-6 py-4"><div className="text-sm font-semibold text-gray-900">{t.name}</div><div className="text-sm text-gray-500">{t.description}</div></td>
+                <td className="px-6 py-4 text-sm text-gray-900">{naira(t.nightlyRate)}</td>
+                <td className="px-6 py-4 text-sm text-gray-900">{t.capacity} person(s)</td>
+                <td className="whitespace-nowrap px-6 py-4 text-sm font-medium">
+                  <Link to={`/room-types/${t.id}`} className="mr-3 text-indigo-600 hover:underline">Show</Link>
+                  {canManage && <button className="mr-3 text-indigo-600 hover:underline" onClick={() => nav(`/room-types/${t.id}/edit`)}>Edit</button>}
+                  {canManage && <button className="text-red-600 hover:underline" onClick={() => remove(t)}>Delete</button>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {isLoading && <p className="p-8 text-center text-sm text-gray-500">Loading room types…</p>}
+        {!isLoading && !data?.length && <p className="p-8 text-center text-sm text-gray-500">No room types yet.</p>}
+      </div>
+    </div>
   );
 }

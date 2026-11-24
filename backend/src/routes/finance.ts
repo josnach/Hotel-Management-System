@@ -34,87 +34,428 @@ const range = (q: Record<string, unknown>) => ({
 
 // Chart of accounts
 
+const accountPrefix: Record<AccountType, string> = {
+  ASSET: '1',
+  LIABILITY: '2',
+  EQUITY: '3',
+  REVENUE: '4',
+  EXPENSE: '5',
+};
+
+const accBody = z.object({
+  code: z.string().regex(/^\d{6}$/, 'Use a 6-digit code'),
+  name: z.string().trim().min(1).max(120),
+  type: z.nativeEnum(AccountType),
+  category: z.string().trim().max(80).optional().nullable(),
+  description: z.string().trim().max(500).optional().nullable(),
+    isActive: z.boolean().optional(),
+});
+
 financeRouter.get('/accounts', asyncHandler(async (_q, res) => {
+  const rows = await balances();
 
-  const b = await balances();
-
-  res.json(b.sort((a, c) => a.code.localeCompare(c.code)).map((a) => ({ id: a.id, code: a.code, name: a.name, type: a.type, category: a.category, isActive: a.isActive, isSystem: a.isSystem, balance: a.type === 'ASSET' || a.type === 'EXPENSE' ? a.net : a.net.neg() })));
-
+  res.json(
+    rows
+      .sort((a, b) => a.code.localeCompare(b.code))
+      .map((a) => ({
+        id: a.id,
+        code: a.code,
+        name: a.name,
+        type: a.type,
+        category: a.category,
+        description: a.description,
+        isActive: a.isActive,
+        isSystem: a.isSystem,
+        createdAt: a.createdAt,
+        updatedAt: a.updatedAt,
+        balance:
+          a.type === 'ASSET' || a.type === 'EXPENSE'
+            ? a.net
+            : a.net.neg(),
+      })),
+  );
 }));
 
-const accBody = z.object({ code: z.string().regex(/^\d{6}$/, 'Use a 6-digit code'), name: z.string().min(1), type: z.nativeEnum(AccountType), category: z.string().optional() });
+financeRouter.get('/accounts/:id', asyncHandler(async (req, res) => {
+  const account = await prisma.account.findUniqueOrThrow({
+    where: { id: req.params.id },
+    include: {
+      _count: { select: { lines: true } },
+      lines: {
+        take: 15,
+        orderBy: { entry: { date: 'desc' } },
+        include: { entry: true },
+      },
+    },
+  });
+
+  const accountBalance = (await balances()).find(
+    (item) => item.id === account.id,
+  );
+
+  const balance = accountBalance
+    ? account.type === 'ASSET' || account.type === 'EXPENSE'
+      ? accountBalance.net
+      : accountBalance.net.neg()
+    : D(0);
+
+  res.json({
+    id: account.id,
+    code: account.code,
+    name: account.name,
+    type: account.type,
+    category: account.category,
+    description: account.description,
+    isActive: account.isActive,
+    isSystem: account.isSystem,
+    createdAt: account.createdAt,
+    updatedAt: account.updatedAt,
+    balance,
+    hasEntries: account._count.lines > 0,
+    entryCount: account._count.lines,
+    recentEntries: account.lines.map((line) => ({
+      id: line.id,
+      date: line.entry.date,
+      txnNo: line.entry.txnNo,
+      reference: line.entry.reference,
+      description: line.entry.description,
+      memo: line.memo,
+      debit: line.debit,
+      credit: line.credit,
+    })),
+  });
+}));
 
 financeRouter.post('/accounts', acct, asyncHandler(async (req, res) => {
+  const body = parse(accBody, req.body);
 
-  const b = parse(accBody, req.body);
+  if (!body.code.startsWith(accountPrefix[body.type])) {
+    throw new HttpError(
+      400,
+      `${body.type} accounts must start with ${accountPrefix[body.type]}`,
+    );
+  }
 
-  const expected = { ASSET: '1', LIABILITY: '2', EQUITY: '3', REVENUE: '4', EXPENSE: '5' }[b.type];
+  const account = await prisma.account.create({
+    data: body,
+  });
 
-  if (!b.code.startsWith(expected)) throw new HttpError(400, `${b.type} accounts must start with ${expected}`);
-
-  res.status(201).json(await prisma.account.create({ data: b }));
-
+  res.status(201).json(account);
 }));
 
-financeRouter.put('/accounts/:id', acct, asyncHandler(async (req, res) => res.json(await prisma.account.update({ where: { id: req.params.id }, data: parse(accBody.partial().omit({ code: true }), req.body) }))));
+financeRouter.put('/accounts/:id', acct, asyncHandler(async (req, res) => {
+  const body = parse(
+    accBody.partial().omit({ code: true }),
+    req.body,
+  );
 
-financeRouter.post('/accounts/:id/toggle', acct, asyncHandler(async (req, res) => { const a = await prisma.account.findUniqueOrThrow({ where: { id: req.params.id } }); res.json(await prisma.account.update({ where: { id: a.id }, data: { isActive: !a.isActive } })); }));
+  const account = await prisma.account.findUniqueOrThrow({
+    where: { id: req.params.id },
+  });
+
+  const entryCount = await prisma.journalLine.count({
+    where: { accountId: account.id },
+  });
+
+  if (body.type && body.type !== account.type && entryCount > 0) {
+    throw new HttpError(
+      409,
+      'An account with journal entries cannot be reclassified.',
+    );
+  }
+
+  if (body.type && !account.code.startsWith(accountPrefix[body.type])) {
+    throw new HttpError(
+      400,
+      `${body.type} accounts must start with ${accountPrefix[body.type]}`,
+    );
+  }
+
+  const updated = await prisma.account.update({
+    where: { id: account.id },
+    data: body,
+  });
+
+  res.json(updated);
+}));
+
+financeRouter.post('/accounts/:id/toggle', acct, asyncHandler(async (req, res) => {
+  const account = await prisma.account.findUniqueOrThrow({
+    where: { id: req.params.id },
+  });
+
+  const updated = await prisma.account.update({
+    where: { id: account.id },
+    data: { isActive: !account.isActive },
+  });
+
+  res.json(updated);
+}));
 
 financeRouter.delete('/accounts/:id', acct, asyncHandler(async (req, res) => {
+  const account = await prisma.account.findUniqueOrThrow({
+    where: { id: req.params.id },
+  });
 
-  const a = await prisma.account.findUniqueOrThrow({ where: { id: req.params.id } });
+  if (account.isSystem) {
+    throw new HttpError(409, 'System accounts cannot be deleted');
+  }
 
-  if (a.isSystem) throw new HttpError(409, 'System accounts cannot be deleted');
+  const entryCount = await prisma.journalLine.count({
+    where: { accountId: account.id },
+  });
 
-  if (await prisma.journalLine.count({ where: { accountId: a.id } })) throw new HttpError(409, 'Accounts with entries cannot be deleted. Deactivate it instead.');
+  if (entryCount > 0) {
+    throw new HttpError(
+      409,
+      'Accounts with entries cannot be deleted. Deactivate it instead.',
+    );
+  }
 
-  await prisma.account.delete({ where: { id: a.id } }); res.status(204).end();
+  await prisma.account.delete({
+    where: { id: account.id },
+  });
 
+  res.status(204).end();
 }));
-
 
 
 // Journal
 
-financeRouter.get('/journal', asyncHandler(async (req, res) => {
+financeRouter.get(
+  '/journal',
+  asyncHandler(async (req, res) => {
+    const { skip, take } = page(req.query, 50);
 
-  const { skip, take } = page(req.query, 50);
+    const { start, end, accountId, type, txnNo } =
+      req.query as Record<string, string | undefined>;
 
-  const { start, end, accountId, type, txnNo } = req.query as Record<string, string | undefined>;
+    const where = {
+      entry: {
+        ...(start || end
+          ? {
+              date: {
+                gte: start ? new Date(start) : undefined,
+                lte: end
+                  ? new Date(`${end}T23:59:59.999`)
+                  : undefined,
+              },
+            }
+          : {}),
+        ...(txnNo ? { txnNo: Number(txnNo) } : {}),
+      },
+      ...(accountId ? { accountId } : {}),
+      ...(type === 'DEBIT'
+        ? { debit: { gt: 0 } }
+        : type === 'CREDIT'
+          ? { credit: { gt: 0 } }
+          : {}),
+    };
 
-  const where = {
+    const [rows, total, sums] = await Promise.all([
+      prisma.journalLine.findMany({
+        where,
+        skip,
+        take,
+        include: {
+          entry: true,
+          account: true,
+        },
+        orderBy: [
+          { entry: { date: 'desc' } },
+          { entryId: 'desc' },
+        ],
+      }),
+      prisma.journalLine.count({ where }),
+      prisma.journalLine.aggregate({
+        where,
+        _sum: {
+          debit: true,
+          credit: true,
+        },
+      }),
+    ]);
 
-    entry: { ...(start || end ? { date: { gte: start ? new Date(start) : undefined, lte: end ? new Date(`${end}T23:59:59`) : undefined } } : {}), ...(txnNo ? { txnNo: Number(txnNo) } : {}) },
+    const dr = D(sums._sum.debit ?? 0);
+    const cr = D(sums._sum.credit ?? 0);
 
-    ...(accountId ? { accountId } : {}),
+    res.json({
+      total,
+      totalDebits: dr,
+      totalCredits: cr,
+      balanced: dr.equals(cr),
+      difference: dr.minus(cr),
+      rows: rows.map((line) => ({
+        id: line.id,
+        entryId: line.entryId,
+        date: line.entry.date,
+        txnNo: line.entry.txnNo,
+        reference: line.entry.reference,
+        account: line.account.name,
+        accountCode: line.account.code,
+        type: line.debit.gt(0) ? 'Debit' : 'Credit',
+        description: line.entry.description,
+        memo: line.memo,
+        amount: line.debit.gt(0) ? line.debit : line.credit,
+      })),
+    });
+  }),
+);
 
-    ...(type === 'DEBIT' ? { debit: { gt: 0 } } : type === 'CREDIT' ? { credit: { gt: 0 } } : {}),
+// Full transaction details
+financeRouter.get(
+  '/journal/:id',
+  asyncHandler(async (req, res) => {
+    const entry = await prisma.journalEntry.findUnique({
+      where: { id: req.params.id },
+      include: {
+        lines: {
+          include: {
+            account: true,
+          },
+          orderBy: {
+            account: {
+              code: 'asc',
+            },
+          },
+        },
+      },
+    });
 
-  };
+    if (!entry) {
+      throw new HttpError(404, 'Journal entry not found');
+    }
 
-  const [rows, total, sums] = await Promise.all([
+    const totalDebits = entry.lines.reduce(
+      (sum, line) => sum.plus(line.debit),
+      D(0),
+    );
 
-    prisma.journalLine.findMany({ where, skip, take, include: { entry: true, account: true }, orderBy: { entry: { date: 'desc' } } }),
+    const totalCredits = entry.lines.reduce(
+      (sum, line) => sum.plus(line.credit),
+      D(0),
+    );
 
-    prisma.journalLine.count({ where }), prisma.journalLine.aggregate({ where, _sum: { debit: true, credit: true } }),
+    res.json({
+      id: entry.id,
+      txnNo: entry.txnNo,
+      date: entry.date,
+      reference: entry.reference,
+      description: entry.description,
+      createdAt: entry.createdAt,
+      totalDebits,
+      totalCredits,
+      balanced: totalDebits.equals(totalCredits),
+      lines: entry.lines.map((line) => ({
+        id: line.id,
+        accountId: line.accountId,
+        code: line.account.code,
+        account: line.account.name,
+        type: line.debit.gt(0) ? 'Debit' : 'Credit',
+        debit: line.debit,
+        credit: line.credit,
+        memo: line.memo,
+      })),
+    });
+  }),
+);
 
-  ]);
+// Manual journal entry
+financeRouter.post(
+  '/journal',
+  acct,
+  asyncHandler(async (req, res) => {
+    const b = parse(
+      z.object({
+        date: z.coerce.date().optional(),
+        reference: z.string().trim().max(120).optional().nullable(),
+        description: z.string().trim().min(3).max(500),
+        lines: z
+          .array(
+            z.object({
+              code: z.string().trim().min(1),
+              debit: z.coerce.number().min(0).optional(),
+              credit: z.coerce.number().min(0).optional(),
+              memo: z.string().trim().max(250).optional(),
+            }),
+          )
+          .min(2),
+      }),
+      req.body,
+    );
 
-  const dr = D(sums._sum.debit ?? 0), cr = D(sums._sum.credit ?? 0);
+    const lines = b.lines;
 
-  res.json({ total, totalDebits: dr, totalCredits: cr, balanced: dr.equals(cr), difference: dr.minus(cr), rows: rows.map((l) => ({ id: l.id, date: l.entry.date, txnNo: l.entry.txnNo, account: l.account.name, accountCode: l.account.code, type: l.debit.gt(0) ? 'Debit' : 'Credit', description: l.entry.description, amount: l.debit.gt(0) ? l.debit : l.credit })) });
+    for (const [index, line] of lines.entries()) {
+      const debit = D(line.debit ?? 0);
+      const credit = D(line.credit ?? 0);
 
-}));
+      if (debit.lt(0) || credit.lt(0)) {
+        throw new HttpError(400, `Line ${index + 1}: amounts cannot be negative`);
+      }
 
-financeRouter.post('/journal', acct, asyncHandler(async (req, res) => {
+      if (debit.gt(0) === credit.gt(0)) {
+        throw new HttpError(
+          400,
+          `Line ${index + 1}: enter an amount in either Debit or Credit, not both`,
+        );
+      }
+    }
 
-  const b = parse(z.object({ date: z.coerce.date().optional(), description: z.string().min(3), lines: z.array(z.object({ code: z.string(), debit: z.coerce.number().min(0).optional(), credit: z.coerce.number().min(0).optional() })).min(2) }), req.body);
+    const totalDebit = lines.reduce(
+      (sum, line) => sum.plus(D(line.debit ?? 0)),
+      D(0),
+    );
 
-  res.status(201).json(await prisma.$transaction((tx) => postJournal(tx, { ...b, userId: req.user!.id })));
+    const totalCredit = lines.reduce(
+      (sum, line) => sum.plus(D(line.credit ?? 0)),
+      D(0),
+    );
 
-}));
+    if (totalDebit.lte(0) || totalCredit.lte(0)) {
+      throw new HttpError(400, 'Journal entries must contain debit and credit amounts');
+    }
 
+    if (!totalDebit.equals(totalCredit)) {
+      throw new HttpError(
+        400,
+        `Journal is not balanced. Debit: ${totalDebit}, Credit: ${totalCredit}`,
+      );
+    }
 
+    const codes = [...new Set(lines.map((line) => line.code))];
+
+    const accounts = await prisma.account.findMany({
+      where: {
+        code: { in: codes },
+        isActive: true,
+      },
+      select: {
+        code: true,
+      },
+    });
+
+    const activeCodes = new Set(accounts.map((account) => account.code));
+    const unavailable = codes.filter((code) => !activeCodes.has(code));
+
+    if (unavailable.length) {
+      throw new HttpError(
+        400,
+        `These accounts are missing or inactive: ${unavailable.join(', ')}`,
+      );
+    }
+
+    const entry = await prisma.$transaction((tx) =>
+      postJournal(tx, {
+        ...b,
+        reference: b.reference || undefined,
+        userId: req.user!.id,
+      }),
+    );
+
+    res.status(201).json(entry);
+  }),
+);
 
 // Financial statements
 

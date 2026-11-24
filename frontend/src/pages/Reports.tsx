@@ -55,13 +55,296 @@ export function SalesSummary() {
 }
 
 export function Complimentary() {
-  const [f, setF] = useState({ start: monthStart(), end: today() }); const [ap, setAp] = useState(f); const { data } = useGet('/reports/complimentary', ap);
-  const list = (t: string, rows: any[] | undefined) => <Card className="p-4"><b>{t}</b>{!rows?.length ? <p className="py-6 text-center text-sm text-muted-foreground">No data</p> : rows.map((r) => <div key={r.name} className="flex justify-between border-b py-1 text-sm"><span>{r.name}</span><b>{r.count}</b></div>)}</Card>;
-  return (<>
-    <PageHeader title="Complimentary Stay Report" subtitle="Track and analyze complimentary stays across the hotel" />
-    <Card className="mb-4 flex items-end gap-3 p-4"><Field label="Start Date"><Input type="date" value={f.start} onChange={(e) => setF({ ...f, start: e.target.value })} /></Field><Field label="End Date"><Input type="date" value={f.end} onChange={(e) => setF({ ...f, end: e.target.value })} /></Field><Button variant="purple" onClick={() => setAp(f)}>Apply Filter</Button></Card>
-    <div className="mb-4 grid gap-3 md:grid-cols-4"><Stat tone="purple" label="Total Complimentary Stays" value={data?.totalStays ?? 0} /><Stat tone="green" label="Total Comp Value" value={money(data?.totalValue)} /><Stat tone="blue" label="Average Comp Value" value={money(data?.averageValue)} /><Stat tone="yellow" label="Period" value={<span className="text-base">{d(ap.start)} – {d(ap.end)}</span>} /></div>
-    <div className="grid gap-4 md:grid-cols-2">{list('Complimentary Stays by Reason', data?.byReason)}{list('Complimentary Stays by Authorizer', data?.byAuthorizer)}</div></>);
+  const initialFilters = {
+    start: monthStart(),
+    end: today(),
+  };
+
+  const [f, setF] = useState(initialFilters);
+  const [ap, setAp] = useState(initialFilters);
+
+  const { data } = useGet('/reports/complimentary', ap);
+
+  const rows: any[] = data?.rows ?? [];
+
+  const guestName = (guest: any) =>
+    guest?.fullName ||
+    guest?.name ||
+    [guest?.firstName, guest?.lastName].filter(Boolean).join(' ') ||
+    '—';
+
+  const breakdown = (title: string, items: any[] | undefined) => (
+    <Card className="p-4">
+      <h3 className="mb-3 font-semibold">{title}</h3>
+
+      {!items?.length ? (
+        <p className="py-8 text-center text-sm text-muted-foreground">
+          No data available for the selected period
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {items.map((item) => (
+            <div
+              key={item.name}
+              className="flex items-center justify-between gap-3 border-b py-2 text-sm last:border-0"
+            >
+              <span className="min-w-0 break-words">{item.name}</span>
+              <b className="shrink-0">{item.count}</b>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+
+  const resetFilters = () => {
+    const defaults = {
+      start: monthStart(),
+      end: today(),
+    };
+
+    setF(defaults);
+    setAp(defaults);
+  };
+
+  const exportCsv = () => {
+    if (!rows.length) return;
+
+    const headers = [
+      'DATE',
+      'GUEST',
+      'ROOM',
+      'REASON',
+      'AUTHORIZED BY',
+      'COMP VALUE',
+      'REFERENCE',
+    ];
+
+    const csvValue = (value: unknown) =>
+      `"${String(value ?? '').replace(/"/g, '""')}"`;
+
+    const records = rows.map((row) => [
+      d(row.checkInAt),
+      guestName(row.guest),
+      row.room?.number ?? '',
+      row.complimentaryReason ?? 'Unspecified',
+      row.authorizedBy ?? 'Unspecified',
+      row.compValue === null ? 'Not posted' : row.compValue,
+      row.reference ?? '',
+    ]);
+
+    const csv = [headers, ...records]
+      .map((record) => record.map(csvValue).join(','))
+      .join('\r\n');
+
+    const blob = new Blob(['\uFEFF', csv], {
+      type: 'text/csv;charset=utf-8;',
+    });
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+
+    link.href = url;
+    link.download = `complimentary-stays-${ap.start}-to-${ap.end}.csv`;
+
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <>
+      <PageHeader
+        title="Complimentary Stay Report"
+        subtitle="Track and analyze complimentary stays across the hotel"
+      />
+
+      <Card className="mb-4 p-4">
+        <h3 className="mb-4 font-semibold">Filter Report</h3>
+
+        <div className="flex flex-col items-end gap-3 md:flex-row">
+          <Field label="Start Date">
+            <Input
+              type="date"
+              value={f.start}
+              onChange={(e) =>
+                setF((current) => ({
+                  ...current,
+                  start: e.target.value,
+                }))
+              }
+            />
+          </Field>
+
+          <Field label="End Date">
+            <Input
+              type="date"
+              value={f.end}
+              onChange={(e) =>
+                setF((current) => ({
+                  ...current,
+                  end: e.target.value,
+                }))
+              }
+            />
+          </Field>
+
+          <div className="flex w-full gap-2 md:w-auto">
+            <Button
+              variant="purple"
+              onClick={() => setAp(f)}
+              disabled={!f.start || !f.end || f.start > f.end}
+            >
+              Apply Filter
+            </Button>
+
+            <Button variant="outline" onClick={resetFilters}>
+              Reset
+            </Button>
+          </div>
+        </div>
+      </Card>
+
+      <div className="mb-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <Stat
+          tone="purple"
+          label="Total Complimentary Stays"
+          value={data?.totalStays ?? 0}
+        />
+
+        <Stat
+          tone="green"
+          label="Total Comp Value"
+          value={money(data?.totalValue ?? 0)}
+        />
+
+        <Stat
+          tone="blue"
+          label="Average Comp Value"
+          value={money(data?.averageValue ?? 0)}
+        />
+
+        <Stat
+          tone="yellow"
+          label="Period"
+          value={
+            <span className="text-base">
+              {d(ap.start)} – {d(ap.end)}
+            </span>
+          }
+        />
+      </div>
+
+      {data?.unpostedCount > 0 && (
+        <div className="mb-4 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+          {data.unpostedCount} complimentary stay
+          {data.unpostedCount === 1 ? '' : 's'} do not have a matching
+          complimentary journal posting. Their values are excluded from
+          the total and average until the accounting entries are available.
+        </div>
+      )}
+
+      <div className="mb-4 grid gap-4 md:grid-cols-2">
+        {breakdown(
+          'Complimentary Stays by Reason',
+          data?.byReason,
+        )}
+
+        {breakdown(
+          'Complimentary Stays by Authorizer',
+          data?.byAuthorizer,
+        )}
+      </div>
+
+      <Card className="p-4">
+        <div className="mb-4 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+          <div>
+            <h3 className="font-semibold">
+              Detailed Complimentary Stay Records
+            </h3>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {rows.length} record{rows.length === 1 ? '' : 's'} found
+            </p>
+          </div>
+
+          <Button
+            variant="outline"
+            onClick={exportCsv}
+            disabled={!rows.length}
+          >
+            Export to CSV
+          </Button>
+        </div>
+
+        {!rows.length ? (
+          <p className="py-10 text-center text-sm text-muted-foreground">
+            No complimentary stays found for {d(ap.start)} – {d(ap.end)}
+          </p>
+        ) : (
+          <div className="w-full overflow-x-auto">
+            <table className="w-full min-w-[950px] text-left text-sm">
+              <thead>
+                <tr className="border-b bg-muted/40 text-xs font-semibold">
+                  <th className="whitespace-nowrap px-3 py-3">DATE</th>
+                  <th className="whitespace-nowrap px-3 py-3">GUEST</th>
+                  <th className="whitespace-nowrap px-3 py-3">ROOM</th>
+                  <th className="whitespace-nowrap px-3 py-3">REASON</th>
+                  <th className="whitespace-nowrap px-3 py-3">
+                    AUTHORIZED BY
+                  </th>
+                  <th className="whitespace-nowrap px-3 py-3 text-right">
+                    COMP VALUE
+                  </th>
+                  <th className="whitespace-nowrap px-3 py-3">REFERENCE</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {rows.map((row) => (
+                  <tr
+                    key={row.id}
+                    className="border-b last:border-0"
+                  >
+                    <td className="whitespace-nowrap px-3 py-3">
+                      {d(row.checkInAt)}
+                    </td>
+
+                    <td className="px-3 py-3 font-medium">
+                      {guestName(row.guest)}
+                    </td>
+
+                    <td className="px-3 py-3">
+                      {row.room?.number ?? '—'}
+                    </td>
+
+                    <td className="px-3 py-3">
+                      {row.complimentaryReason || 'Unspecified'}
+                    </td>
+
+                    <td className="px-3 py-3">
+                      {row.authorizedBy || 'Unspecified'}
+                    </td>
+
+                    <td className="whitespace-nowrap px-3 py-3 text-right font-medium">
+                      {row.compValue === null
+                        ? 'Not posted'
+                        : money(row.compValue)}
+                    </td>
+
+                    <td className="whitespace-nowrap px-3 py-3 font-mono text-xs">
+                      {row.reference}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
+    </>
+  );
 }
 
 export function Shifts() {

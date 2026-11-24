@@ -2,20 +2,21 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { Prisma, OrderStatus, PaymentStatus } from '@prisma/client';
-import { asyncHandler, page, parse , HttpError } from '../lib/http';
+import { asyncHandler, page, parse, HttpError } from '../lib/http';
 import { D, prisma } from '../lib/prisma';
 import { requireRole } from '../middleware/auth';
-import { createOrder, payOrder, voidOrder } from '../services/orders';
+import { createOrder, payOrder, voidOrder, updateOrderStatus, completeOrder } from '../services/orders';
+import { notifyRoles, notifyStaff } from '../services/staffNotifications';
 
-const pos = requireRole('WAITER', 'RECEPTIONIST');
-const kitchen = requireRole('WAITER', 'RECEPTIONIST', 'CHEF');
+const pos = requireRole('WAITER', 'MANAGER');
+const kitchen = requireRole('WAITER', 'CHEF', 'MANAGER');
 
 export const salesPointsRouter = Router();
 
 const manage = requireRole('ADMIN', 'MANAGER');
 
 // POS and everyone: active only. Admin/Manager can pass ?all=true to also see deactivated ones.
-salesPointsRouter.get('/', asyncHandler(async (req, res) => {
+salesPointsRouter.get('/', pos, asyncHandler(async (req, res) => {
   const editor = ['ADMIN', 'MANAGER'].includes(req.user!.role);
   const all = req.query.all === 'true' && editor;
 
@@ -27,36 +28,45 @@ salesPointsRouter.get('/', asyncHandler(async (req, res) => {
   );
 }));
 
+/** Management cards: every sales point with location and counts. */
+salesPointsRouter.get('/overview', manage, asyncHandler(async (_q, res) => {
+  const rows = await prisma.salesPoint.findMany({
+    orderBy: { id: 'asc' }, // cuid ids sort by creation time; use { name: 'asc' } for A-Z
+    include: { _count: { select: { items: true, folioTxs: true } } },
+  });
+  res.json(rows.map((s) => ({
+    id: s.id, name: s.name, location: s.location, isActive: s.isActive,
+    itemCount: s._count.items, transactionCount: s._count.folioTxs,
+  })));
+}));
 salesPointsRouter.post('/', manage, asyncHandler(async (req, res) => {
-  const { name } = parse(
-    z.object({ name: z.string().trim().min(1) }),
+  const { name, location } = parse(
+    z.object({
+      name: z.string().trim().min(1),
+      location: z.string().trim().max(120).optional(),
+    }),
     req.body,
   );
 
   try {
     res.status(201).json(
       await prisma.salesPoint.create({
-        data: { name },
+        data: { name, location: location || null },
       }),
     );
   } catch (e) {
-    if (
-      e instanceof Prisma.PrismaClientKnownRequestError &&
-      e.code === 'P2002'
-    ) {
-      return res.status(409).json({
-        message: 'A sales point with this name already exists',
-      });
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+      return res.status(409).json({ message: 'A sales point with this name already exists' });
     }
-
     throw e;
   }
 }));
 
 salesPointsRouter.put('/:id', manage, asyncHandler(async (req, res) => {
-  const data = parse(
+  const { location, ...rest } = parse(
     z.object({
       name: z.string().trim().min(1).optional(),
+      location: z.string().trim().max(120).optional(),
       isActive: z.boolean().optional(),
     }),
     req.body,
@@ -66,24 +76,19 @@ salesPointsRouter.put('/:id', manage, asyncHandler(async (req, res) => {
     res.json(
       await prisma.salesPoint.update({
         where: { id: req.params.id },
-        data,
+        data: { ...rest, ...(location !== undefined ? { location: location || null } : {}) },
       }),
     );
   } catch (e) {
-    if (
-      e instanceof Prisma.PrismaClientKnownRequestError &&
-      e.code === 'P2002'
-    ) {
-      return res.status(409).json({
-        message: 'A sales point with this name already exists',
-      });
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+      return res.status(409).json({ message: 'A sales point with this name already exists' });
     }
-
     throw e;
   }
 }));
 
-// Delete if it has never been used; otherwise deactivate so orders, stock and folio history stay intact.
+// Delete if it has never been used; otherwise deactivate so orders,
+// stock and folio history stay intact.
 salesPointsRouter.delete('/:id', manage, asyncHandler(async (req, res) => {
   const id = req.params.id;
 
@@ -106,24 +111,81 @@ salesPointsRouter.delete('/:id', manage, asyncHandler(async (req, res) => {
   await prisma.salesPoint.delete({ where: { id } });
   res.status(204).end();
 }));
+/** POS catalogue: only products available at the selected sales point. */
+salesPointsRouter.get('/:id/catalog', pos, asyncHandler(async (req, res) => {
+  const salesPoint = await prisma.salesPoint.findUnique({
+    where: { id: req.params.id },
+  });
 
-/** POS catalog: categories (with counts) and items for one sales point. */
-salesPointsRouter.get('/:id/catalog', asyncHandler(async (req, res) => {
-  const items = await prisma.inventoryItem.findMany({
+  if (!salesPoint || !salesPoint.isActive) {
+    throw new HttpError(404, 'Active sales point not found');
+  }
+
+  const rows = await prisma.inventoryItem.findMany({
     where: {
-      salesPointId: req.params.id,
+      salesPointId: salesPoint.id,
       isActive: true,
       category: { isActive: true },
+      OR: [
+        { menuProductId: null },
+        {
+          menuProduct: {
+            isActive: true,
+            availability: {
+              some: {
+                salesPointId: salesPoint.id,
+                isAvailable: true,
+              },
+            },
+          },
+        },
+      ],
     },
-    include: { category: true, recipeLines: { include: { ingredient: true } } },
+    include: {
+      category: true,
+      menuProduct: {
+        include: {
+          availability: {
+            where: { salesPointId: salesPoint.id },
+          },
+        },
+      },
+      recipeLines: {
+        include: { ingredient: true },
+      },
+    },
     orderBy: { name: 'asc' },
   });
-  // A dish or shot has no stock of its own: show how many portions its ingredients allow, so the POS greys it out when it runs short.
-  const catalog = items.map(({ recipeLines, ...i }) => recipeLines.length
-    ? { ...i, hasRecipe: true, quantity: D(Math.min(...recipeLines.map((l) => (D(l.quantity).gt(0) ? Math.floor(D(l.ingredient.quantity).div(l.quantity).toNumber()) : Infinity))))  }
-    : { ...i, hasRecipe: false });
 
-  const cats = new Map<
+  const items = rows.map(({ recipeLines, menuProduct, ...item }) => {
+    const sellPrice = menuProduct?.sellPrice ?? item.sellPrice;
+
+    const quantity = recipeLines.length
+      ? D(
+          Math.min(
+            ...recipeLines.map((line) =>
+              D(line.quantity).gt(0)
+                ? Math.floor(
+                    D(line.ingredient.quantity)
+                      .div(line.quantity)
+                      .toNumber(),
+                  )
+                : Infinity,
+            ),
+          ),
+        )
+      : item.quantity;
+
+    return {
+      ...item,
+      menuProductId: menuProduct?.id ?? null,
+      sellPrice,
+      hasRecipe: recipeLines.length > 0,
+      quantity,
+    };
+  });
+
+  const categoryMap = new Map<
     string,
     {
       id: string;
@@ -134,24 +196,25 @@ salesPointsRouter.get('/:id/catalog', asyncHandler(async (req, res) => {
     }
   >();
 
-  items.forEach((i) => {
-    const c = cats.get(i.categoryId) ?? {
-      id: i.categoryId,
-      name: i.category.name,
-      section: i.category.section,
-      sortOrder: i.category.sortOrder,
+  for (const item of items) {
+    const category = categoryMap.get(item.categoryId) ?? {
+      id: item.categoryId,
+      name: item.category.name,
+      section: item.category.section,
+      sortOrder: item.category.sortOrder,
       count: 0,
     };
 
-    c.count++;
-    cats.set(i.categoryId, c);
-  });
+    category.count++;
+    categoryMap.set(item.categoryId, category);
+  }
 
-  const categories = [...cats.values()].sort(
-    (a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name),
+  const categories = [...categoryMap.values()].sort(
+    (a, b) =>
+      a.sortOrder - b.sortOrder || a.name.localeCompare(b.name),
   );
 
-  res.json({ categories, items: catalog });
+  res.json({ categories, items });
 }));
 
 export const ordersRouter = Router();
@@ -185,7 +248,7 @@ const orderBody = z.object({
   notes: z.string().optional(),
 });
 
-ordersRouter.get('/', asyncHandler(async (req, res) => {
+ordersRouter.get('/', pos, asyncHandler(async (req, res) => {
   const { skip, take } = page(req.query);
   const { status, from, to } = req.query as Record<
     string,
@@ -231,7 +294,7 @@ ordersRouter.get('/', asyncHandler(async (req, res) => {
   });
 }));
 
-ordersRouter.get('/kitchen', asyncHandler(async (_q, res) => {
+ordersRouter.get('/kitchen', kitchen, asyncHandler(async (_q, res) => {
   const include = {
     items: { include: { item: true } },
     salesPoint: true,
@@ -254,7 +317,7 @@ ordersRouter.get('/kitchen', asyncHandler(async (_q, res) => {
 }));
 
 /** Unpaid bills / Credit Transactions */
-ordersRouter.get('/credit', asyncHandler(async (req, res) => {
+ordersRouter.get('/credit', pos, asyncHandler(async (req, res) => {
   const {
     paymentStatus,
     guestId,
@@ -303,7 +366,7 @@ ordersRouter.get('/credit', asyncHandler(async (req, res) => {
   });
 }));
 
-ordersRouter.get('/unpaid-count', asyncHandler(async (_q, res) => {
+ordersRouter.get('/unpaid-count', pos, asyncHandler(async (_q, res) => {
   res.json({
     count: await prisma.order.count({
       where: { paymentStatus: 'UNPAID' },
@@ -311,7 +374,7 @@ ordersRouter.get('/unpaid-count', asyncHandler(async (_q, res) => {
   });
 }));
 
-ordersRouter.get('/:id', asyncHandler(async (req, res) =>
+ordersRouter.get('/:id', pos, asyncHandler(async (req, res) =>
   res.json(
     await prisma.order.findUniqueOrThrow({
       where: { id: req.params.id },
@@ -347,23 +410,65 @@ ordersRouter.post('/', pos, asyncHandler(async (req, res) => {
 }));
 
 // The chef must be able to advance order status.
-ordersRouter.patch('/:id/status', kitchen, asyncHandler(async (req, res) => {
-  const { status } = parse(
-    z.object({ status: z.nativeEnum(OrderStatus) }),
-    req.body,
-  );
+ordersRouter.patch(
+  '/:id/status',
+  kitchen,
+  asyncHandler(async (req, res) => {
+    const { status } = parse(
+      z.object({
+        status: z.nativeEnum(OrderStatus),
+      }),
+      req.body,
+    );
 
-  // Cancelling must go through Void: it reverses the money and puts the stock back. A bare status change does neither.
-  if (status === 'CANCELLED') throw new HttpError(400, 'Use "Void order" to cancel an order');
-  const current = await prisma.order.findUniqueOrThrow({ where: { id: req.params.id }, select: { paymentStatus: true } });
-  if (current.paymentStatus === 'VOIDED') throw new HttpError(409, 'This order has been voided');
-  res.json(
-    await prisma.order.update({
-      where: { id: req.params.id },
-      data: { status },
-    }),
-  );
-}));
+    if (status === 'CANCELLED') {
+      throw new HttpError(
+        400,
+        'Use "Void order" to cancel an order',
+      );
+    }
+
+    const updated = await updateOrderStatus(
+      req.params.id,
+      status,
+      req.user!.id,
+      req.user!.role,
+    );
+
+    // Notify the original waiter when kitchen staff mark
+    // the order as ready.
+    if (status === 'READY') {
+      void notifyStaff(updated.staffId, {
+        title: 'Order ready',
+        body: `Order ${updated.orderNo} is ready for pickup.`,
+        category: 'ORDERS',
+        entityType: 'Order',
+        entityId: updated.id,
+        createdByUserId: req.user!.id,
+      }).catch((error) => {
+        console.error(
+          '[Order Notification] Failed to notify waiter:',
+          error,
+        );
+      });
+    }
+
+    res.json(updated);
+  }),
+);
+
+ordersRouter.post(
+  '/:id/complete',
+  requireRole('WAITER', 'MANAGER'),
+  asyncHandler(async (req, res) => {
+    const completed = await completeOrder(
+      req.params.id,
+      req.user!.id,
+    );
+
+    res.json(completed);
+  }),
+);
 
 ordersRouter.post('/:id/pay', pos, asyncHandler(async (req, res) => {
   const { method } = parse(
@@ -386,6 +491,24 @@ ordersRouter.post(
       req.body,
     );
 
-    res.json(await voidOrder(req.params.id, reason, req.user!.id));
+    const voided = await voidOrder(req.params.id, reason, req.user!.id);
+
+    // Notify management after the void operation succeeds.
+    void notifyRoles(
+      ['ADMIN', 'MANAGER'],
+      {
+        title: 'Order voided',
+        body: `Order ${voided.orderNo} (₦${Number(voided.total).toLocaleString()}) was voided: ${reason}`,
+        category: 'ORDERS',
+        entityType: 'Order',
+        entityId: voided.id,
+        createdByUserId: req.user!.id,
+      },
+      req.user!.id,
+    ).catch((error) => {
+      console.error('[Order Notification] Failed to notify management:', error);
+    });
+
+    res.json(voided);
   }),
 );

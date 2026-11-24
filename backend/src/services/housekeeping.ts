@@ -1,5 +1,6 @@
 import { HkTaskType, Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
+import { notifyRoles } from './staffNotifications';
 
 type Tx = Prisma.TransactionClient;
 
@@ -23,5 +24,12 @@ export async function generateStayoverTasks() {
   const rooms = await prisma.room.findMany({ where: { status: 'OCCUPIED', stays: { some: { status: 'CHECKED_IN', expectedDeparture: { gt: end } } } }, select: { id: true } });
   let created = 0;
   for (const r of rooms) if (await createTask(prisma, r.id, 'STAYOVER')) created++;
+    if (created > 0) {
+    void notifyRoles(['HOUSEKEEPING'], {
+      title: 'Stayover cleans scheduled',
+      body: `${created} light clean(s) were created for today.`,
+      category: 'HOUSEKEEPING',
+    });
+  }
   return created;
 }

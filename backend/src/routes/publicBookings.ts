@@ -7,6 +7,7 @@ import { rateLimit } from 'express-rate-limit';
 import { asyncHandler, parse } from '../lib/http';
 import { prisma } from '../lib/prisma';
 import { assertNotBlacklisted } from '../services/crm';
+import { generateReservationNumber } from '../lib/reservationNumber';
 
 export const publicBookingsRouter = Router();
 
@@ -298,6 +299,7 @@ publicBookingsRouter.post(
 
           const reservation = await tx.reservation.create({
             data: {
+              reservationNumber: generateReservationNumber(),
               guestId: guest.id,
               roomId: currentRoom.id,
               arrival: b.arrival,

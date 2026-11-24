@@ -2,7 +2,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { Prisma } from '@prisma/client';
-
+import { config } from '../config';
 import { asyncHandler, page, parse } from '../lib/http';
 import { D, prisma } from '../lib/prisma';
 import { requireRole } from '../middleware/auth';
@@ -130,11 +130,18 @@ foliosRouter.get(
       };
     });
 
-    res.json({
-      ...f,
-      txs,
-      balance: run,
-    });
+   res.json({
+  ...f,
+  txs,
+  balance: run,
+  hotel: {
+    name: config.hotelName,
+    address: config.hotelAddress,
+    phone: config.hotelPhone,
+    email: config.hotelEmail,
+    website: config.hotelWebsite,
+  },
+});
   }),
 );
 

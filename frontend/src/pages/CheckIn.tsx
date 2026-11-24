@@ -1,3 +1,4 @@
+
 import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
@@ -5,7 +6,6 @@ import {
   LogOut,
   UserPlus,
 } from 'lucide-react';
-
 import { api } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { useAction, useGet } from '@/lib/hooks';
@@ -60,6 +60,9 @@ type Guest = {
   phone: string;
   email?: string | null;
   address?: string | null;
+  nationality?: string | null;
+  idType?: string | null;
+  idNumber?: string | null;
   isVip?: boolean;
   vipNote?: string | null;
   isBlacklisted?: boolean;
@@ -98,6 +101,9 @@ type Policy = {
 };
 
 type CheckInResponse = {
+  stay: {
+    id: string;
+  };
   folio: {
     id: string;
   };
@@ -134,7 +140,6 @@ const DISCOUNT_REASONS = [
   'Long stay',
   'Promotion',
 ];
-
 
 /**
  * Formats a Date as a browser-local datetime-local value.
@@ -235,17 +240,37 @@ export default function CheckIn() {
 
   const { data: groups } = useGet<Group[]>('/groups');
 
-  const { data: reservations } =
-    useGet<Reservation[]>('/reservations');
+  const {
+    data: reservations,
+    isLoading: reservationsLoading,
+  } = useGet<Reservation[]>('/reservations/for-check-in');
 
-  const { data: policy } =
-    useGet<Policy>('/policy');
+  const { data: policy } = useGet<Policy>('/policy');
 
   const [reservationId, setReservationId] = useState('');
   const [q, setQ] = useState('');
   const [guestId, setGuestId] = useState('');
   const [picked, setPicked] = useState<Guest | null>(null);
   const [optIn, setOptIn] = useState(false);
+
+  const [registrationDetails, setRegistrationDetails] = useState({
+    placeOfIssue: '',
+    purposeOfVisit: '',
+    vehicleRegistration: '',
+    emergencyContactName: '',
+    emergencyContactPhone: '',
+    emergencyContactRelationship: '',
+  });
+
+  const updateRegistration = (
+    key: keyof typeof registrationDetails,
+    value: string,
+  ) => {
+    setRegistrationDetails((previous) => ({
+      ...previous,
+      [key]: value,
+    }));
+  };
 
   const [g, setG] = useState({
     firstName: '',
@@ -325,14 +350,14 @@ export default function CheckIn() {
       ) || 0,
     );
 
-  const departureDate = f.expectedDeparture
-  ? new Date(f.expectedDeparture)
-  : null;
+    const departureDate = f.expectedDeparture
+      ? new Date(f.expectedDeparture)
+      : null;
 
-const nights =
-  departureDate && Number.isFinite(departureDate.getTime())
-    ? calendarNights(new Date(), departureDate)
-    : 1;
+    const nights =
+      departureDate && Number.isFinite(departureDate.getTime())
+        ? calendarNights(new Date(), departureDate)
+        : 1;
 
     const gross = rate * nights;
 
@@ -399,6 +424,13 @@ const nights =
             }),
 
         roomId: f.roomId,
+
+        registrationDetails: Object.fromEntries(
+          Object.entries(registrationDetails).filter(
+            ([, value]) => value.trim() !== '',
+          ),
+        ),
+
         groupId: f.groupId || undefined,
         numGuests: Number(f.numGuests),
         expectedDeparture: new Date(
@@ -432,8 +464,10 @@ const nights =
         '/rooms',
         '/stays/in-house',
         '/guests',
+        '/reservations',
+        '/reservations/for-check-in',
       ],
-      onSuccess: (response) => {
+   onSuccess: (response) => {
         nav(`/folios/${response.folio.id}`);
       },
     },
@@ -541,35 +575,69 @@ const nights =
     <div className="mx-auto max-w-2xl">
       <PageHeader title="Guest Check-in" />
 
+      <div className="mb-4 flex justify-end">
+        <Button
+          type="button"
+          onClick={() =>
+            nav('/guest-card', {
+              state: {
+                guest: picked ?? {
+                  firstName: g.firstName,
+                  lastName: g.lastName,
+                  phone: g.phone,
+                  email: g.email,
+                  address: g.address,
+                  idType: g.idType,
+                  idNumber: g.idNumber,
+                },
+                registrationDetails,
+                expectedStay: f.expectedDeparture
+                  ? `${calendarNights(new Date(), new Date(f.expectedDeparture))} night(s)`
+                  : '',
+                roomNumber: room?.number ?? '',
+                staffName: user?.username ?? '',
+                specialRequests: f.specialRequests,
+              },
+            })
+          }
+          className="bg-emerald-600 text-white hover:bg-emerald-700"
+        >
+          Registration Card
+        </Button>
+      </div>
+
       <Card className="space-y-5 p-6">
-        <Field label="Check in from an existing reservation (Optional)">
+        <Field
+          label="Check in from an existing reservation (Optional)"
+          hint={
+            reservationsLoading
+              ? 'Loading todayâ€™s reservationsâ€¦'
+              : eligibleReservations.length
+                ? `${eligibleReservations.length} reservation(s) due for check-in today`
+                : 'No reservations are due for check-in today.'
+          }
+        >
           <NativeSelect
             value={reservationId}
             onChange={(event) =>
               handleReservationChange(event.target.value)
             }
           >
-            <option value="">
-              Walk-in / no reservation
-            </option>
+            <option value="">Walk-in / no reservation</option>
 
             {eligibleReservations.map((reservation) => (
-              <option
-                key={reservation.id}
-                value={reservation.id}
-              >
+              <option key={reservation.id} value={reservation.id}>
                 {reservation.guest.firstName}{' '}
                 {reservation.guest.lastName}
-                {' — Room '}
+                {' â€” Room '}
                 {reservation.room.number}
-                {' — '}
-                {new Date(
-                  reservation.arrival,
-                ).toLocaleDateString()}
+                {' â€” '}
+                {new Date(reservation.arrival).toLocaleDateString()}
                 {' to '}
-                {new Date(
-                  reservation.departure,
-                ).toLocaleDateString()}
+                {new Date(reservation.departure).toLocaleDateString()}
+                {startOfDay(reservation.arrival) === today
+                  ? ' (arriving today)'
+                  : ' (overdue arrival)'}
               </option>
             ))}
           </NativeSelect>
@@ -577,7 +645,7 @@ const nights =
 
         <Field label="Select existing guest">
           <Input
-            placeholder="Type to search existing guests…"
+            placeholder="Type to search existing guests"
             value={q}
             onChange={(event) => {
               setQ(event.target.value);
@@ -604,11 +672,11 @@ const nights =
                 }}
               >
                 {guest.firstName} {guest.lastName}
-                {' · '}
+                {' Â· '}
                 {guest.phone}
-                {guest.isVip ? ' · VIP' : ''}
+                {guest.isVip ? ' Â· VIP' : ''}
                 {guest.isBlacklisted
-                  ? ' · BLACKLISTED'
+                  ? ' Â· BLACKLISTED'
                   : ''}
               </button>
             ))}
@@ -795,14 +863,14 @@ const nights =
                   value={selectedReservation.roomId}
                 >
                   {selectedReservation.room.number}
-                  {' — Reserved room'}
+                  {'Reserved room'}
                 </option>
               )}
 
             {rooms?.map((item) => (
               <option key={item.id} value={item.id}>
                 {item.number}
-                {' — '}
+                {' '}
                 {item.roomType.name}
                 {' ('}
                 {money(
@@ -905,7 +973,7 @@ const nights =
                   Percentage (%)
                 </option>
                 <option value="FIXED">
-                  Fixed amount (₦)
+                  Fixed amount (â‚¦)
                 </option>
               </NativeSelect>
             </Field>
@@ -1057,7 +1125,7 @@ const nights =
             />
           </Field>
 
-          <Field label="Advance Payment (₦)">
+          <Field label="Advance Payment">
             <Input
               type="number"
               min="0"
@@ -1126,11 +1194,12 @@ const nights =
             }
           >
             {submit.isPending
-              ? 'Checking in…'
+              ? 'Checking inâ€¦'
               : 'Check in guest'}
           </Button>
         </div>
       </Card>
+
     </div>
   );
 }

@@ -1,5 +1,4 @@
 
-import type { Server } from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
 
 import { verifyAccessToken } from '../lib/session';
@@ -74,18 +73,19 @@ function isAuthenticated(
 }
 
 /**
- * Attach the authenticated staff notification WebSocket
- * endpoint to the existing HTTP server.
+ * Create the staff notification WebSocket server.
+ *
+ * The HTTP upgrade request is handled centrally
+ * in server.ts.
+ *
+ * Endpoint: /ws
  *
  * Clients must send this as their first message:
  * { type: 'auth', token: '<JWT>' }
  */
-export function attachStaffNotificationSocket(
-  server: Server,
-) {
+export function createStaffNotificationSocket() {
   const wss = new WebSocketServer({
-    server,
-    path: '/ws',
+    noServer: true,
     maxPayload: 8 * 1024,
   });
 
@@ -95,9 +95,15 @@ export function attachStaffNotificationSocket(
     socket.isAlive = true;
     socket.authenticating = false;
 
-    // Require authentication within five seconds.
+    console.log('[Staff WS] New connection received');
+
+    // Require authentication within ten seconds.
     const authTimeout = setTimeout(() => {
       if (!isAuthenticated(socket)) {
+        console.warn(
+          '[Staff WS] Authentication timeout',
+        );
+
         sendJson(socket, {
           type: 'error',
           message: 'Authentication required',
@@ -105,7 +111,7 @@ export function attachStaffNotificationSocket(
 
         socket.close(1008, 'Authentication required');
       }
-    }, 5000);
+    }, 10_000);
 
     socket.on('pong', () => {
       socket.isAlive = true;
@@ -151,8 +157,7 @@ export function attachStaffNotificationSocket(
         return;
       }
 
-      // Authentication must happen before application
-      // commands, including application-level ping.
+      // Authentication must happen before application commands.
       if (
         message.type !== 'auth' ||
         typeof message.token !== 'string' ||
@@ -170,18 +175,22 @@ export function attachStaffNotificationSocket(
       socket.authenticating = true;
 
       try {
-        // Validates the token and its session.
+        // Validate token and session.
         const { user } = await verifyAccessToken(
           message.token,
         );
 
-        // The connection may have closed while validation
-        // was waiting for the session/database lookup.
+        // The connection may have closed during validation.
         if (socket.readyState !== WebSocket.OPEN) {
           return;
         }
 
         socket.staffUserId = user.id;
+
+        console.log(
+          '[Staff WS] Staff authenticated:',
+          user.id,
+        );
 
         const sockets =
           socketsByUser.get(user.id) ??
@@ -197,7 +206,12 @@ export function attachStaffNotificationSocket(
           userId: user.id,
           at: new Date().toISOString(),
         });
-      } catch {
+      } catch (error) {
+        console.error(
+          '[Staff WS] Authentication failed:',
+          error,
+        );
+
         clearTimeout(authTimeout);
 
         if (socket.readyState === WebSocket.OPEN) {
@@ -216,12 +230,23 @@ export function attachStaffNotificationSocket(
       }
     });
 
-    socket.on('close', () => {
+    // Handle disconnection and cleanup once.
+    socket.on('close', (code, reason) => {
+      console.log('[Staff WS] Client disconnected:', {
+        code,
+        reason: reason.toString(),
+      });
+
       clearTimeout(authTimeout);
       removeSocket(socket);
     });
 
-    socket.on('error', () => {
+    socket.on('error', (error) => {
+      console.error(
+        '[Staff WS] Socket error:',
+        error,
+      );
+
       clearTimeout(authTimeout);
       removeSocket(socket);
     });
@@ -254,15 +279,16 @@ export function attachStaffNotificationSocket(
 }
 
 /**
- * Publish a notification after it has been saved to the
- * database. Only authenticated connections belonging to
+ * Publish a notification after it has been saved
+ * to the database.
+ *
+ * Only authenticated connections belonging to
  * the intended recipient receive the event.
  */
 export function publishStaffNotification(
   recipientUserId: string,
   notification: StaffNotificationEvent,
 ): void {
-  // Prevent accidental delivery to a different recipient.
   if (notification.recipientUserId !== recipientUserId) {
     return;
   }

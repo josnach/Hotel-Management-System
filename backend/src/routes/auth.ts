@@ -98,16 +98,26 @@ authRouter.post('/logout', authenticate, asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
-authRouter.post('/change-password', authenticate, asyncHandler(async (req, res) => {
-  const b = parse(z.object({ currentPassword: z.string(), newPassword: z.string().min(8) }), req.body);
+/** Rule shown on the Change Password page: 8+ characters with letters, numbers and symbols. */
+const passwordProblem = (pw: string) => {
+  if (pw.length < 8) return 'Password must be at least 8 characters long.';
+  if (pw.length > 72) return 'Password must be 72 characters or fewer.'; // bcrypt ignores anything past 72 bytes
+  if (!/[A-Za-z]/.test(pw) || !/\d/.test(pw) || !/[^A-Za-z0-9]/.test(pw)) return 'Password must contain a mix of letters, numbers, and symbols.';
+  return null;
+};
+
+authRouter.post('/change-password', authenticate, codeLimiter, asyncHandler(async (req, res) => {
+  const b = parse(z.object({ currentPassword: z.string().min(1), newPassword: z.string() }), req.body);
+  const problem = passwordProblem(b.newPassword);
+  if (problem) throw new HttpError(400, problem);
   const u = await prisma.user.findUniqueOrThrow({ where: { id: req.user!.id } });
   if (!(await bcrypt.compare(b.currentPassword, u.passwordHash))) throw new HttpError(400, 'Current password is incorrect');
+  if (b.currentPassword === b.newPassword) throw new HttpError(400, 'New password must be different from your current password.');
   await prisma.user.update({ where: { id: u.id }, data: { passwordHash: await bcrypt.hash(b.newPassword, 10) } });
-  const r = await revokeAllSessions(u.id, 'PASSWORD_CHANGED', { exceptSessionId: req.user!.sessionId, byUserId: u.id });
-  await audit(prisma, { userId: u.id, action: 'PASSWORD_CHANGED', entity: 'User', entityId: u.id, ip: clientIp(req), meta: { sessionsRevoked: r.count } });
-  res.json({ ok: true, otherSessionsSignedOut: r.count });
+ const r = await revokeAllSessions(u.id, 'PASSWORD_CHANGED', { byUserId: u.id });
+await audit(prisma, { userId: u.id, action: 'PASSWORD_CHANGED', entity: 'User', entityId: u.id, ip: clientIp(req), meta: { sessionsRevoked: r.count } });
+res.json({ ok: true, sessionsSignedOut: r.count });
 }));
-
 /* ───────────── Two-factor setup ───────────── */
 
 authRouter.post('/2fa/setup', authenticate, asyncHandler(async (req, res) => {

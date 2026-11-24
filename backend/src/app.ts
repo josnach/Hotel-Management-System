@@ -26,8 +26,9 @@ import { housekeepingRouter } from './routes/housekeeping';
 import { nightAuditRouter, shiftsRouter } from './routes/nightaudit';
 import { currenciesRouter } from './routes/currencies';
 import { documentsRouter } from './routes/documents';
-import { publicRoomsRouter } from './routes/publicRooms'; 
-
+import { publicRoomsRouter } from './routes/publicRooms';
+import { staffRouter } from './routes/staff';
+import { maintenanceRouter as maintenanceModuleRouter } from './routes/maintenance';
 import { messagingRouter, publicRouter, webhookRouter } from './routes/messaging';
 import staffNotificationsRouter from './routes/staffNotifications.js';
 import { guestRequestsRouter } from './routes/guestrequests';
@@ -35,6 +36,18 @@ import { portalRouter } from './routes/portal';
 import { staffChatRouter } from './routes/staffChat';
 import { revenueForecastRouter } from './routes/revenueForecast';
 import { publicBookingsRouter } from './routes/publicBookings';
+import { workSchedulesRouter } from './routes/workSchedules';
+import { workShiftsRouter } from './routes/workShifts';
+import {
+  isShiftRequired,
+  requireActiveWorkShift,
+} from './services/staffWorkShifts';
+import { cityLedgerRouter } from './routes/cityLedger';
+import { paymentVouchersRouter } from './routes/paymentVouchers';
+import { purchaseOrdersRouter, suppliersRouter } from './routes/purchasing';
+import { reportsExtraRouter } from './routes/reportsExtra';
+import { securityExtraRouter } from './routes/securityExtra';
+
 
 
 export const app = express();
@@ -50,10 +63,35 @@ app.get('/health', (_q, res) => res.json({ ok: true }));
 app.use('/api/auth', authRouter);
 
 const api = express.Router();
+
 api.use(authenticate);
+
+// Staff must be able to access their shift endpoints before clocking in.
+api.use('/work-shifts', workShiftsRouter);
+api.use('/work-schedules', workSchedulesRouter);
+
+// RECEPTIONIST and WAITER must have an active individual work shift
+// before accessing the remaining protected API routes.
+api.use((req, _res, next) => {
+  if (!req.user || !isShiftRequired(req.user.role)) {
+    return next();
+  }
+
+  // Cash drawer has its own independent ShiftSession system.
+  // Do not require a staff work shift for cash drawer endpoints.
+  if (req.path === '/shifts' || req.path.startsWith('/shifts/')) {
+    return next();
+  }
+
+  // All other protected operational endpoints still require
+  // an active individual staff work shift.
+  requireActiveWorkShift(req.user.id)
+    .then(() => next())
+    .catch(next);
+});
 api.use('/users', usersRouter);
 api.use('/rooms', roomsRouter);
-api.use('/maintenance', maintenanceRouter);
+api.use('/maintenance', maintenanceModuleRouter);
 api.use('/guests', guestsRouter);
 api.use('/groups', groupsRouter);
 api.use('/stays', staysRouter);
@@ -64,18 +102,25 @@ api.use('/orders', ordersRouter);
 api.use('/inventory', inventoryRouter);
 api.use('/stores', storesRouter);
 api.use('/events', eventsRouter);
+api.use('/finance/payment-vouchers', paymentVouchersRouter);
+api.use('/finance/suppliers', suppliersRouter);
+api.use('/finance/purchase-orders', purchaseOrdersRouter);
 api.use('/finance', financeRouter);
 api.use('/finance', payrollRouter);
 api.use('/finance/receivables', receivablesRouter);
+api.use('/finance/city-ledger', cityLedgerRouter);
 api.use('/power', powerRouter);
 api.use('/crm', crmRouter);
 api.use('/reports', reportsRouter);
+api.use('/reports', reportsExtraRouter);
+api.use('/security', securityExtraRouter);
 api.use('/security', securityRouter);
 api.use('/dashboard', dashboardRouter);
 api.use('/guard', guardRouter);
 api.use('/audit', auditRouter);
 api.use('/messaging', messagingRouter);
 api.use('/policy', policyRouter);
+api.use('/staff', staffRouter);
 api.use('/bar', barRouter);
 api.use('/housekeeping', housekeepingRouter);
 api.use('/shifts', shiftsRouter);
@@ -89,7 +134,7 @@ api.use('/currencies', currenciesRouter);
 api.use('/documents', documentsRouter);
 app.use('/api/public/rooms', publicRoomsRouter);
 app.use('/api/public/bookings', publicBookingsRouter
-    
+
 );
 app.use('/api', api);
 

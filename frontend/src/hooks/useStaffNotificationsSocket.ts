@@ -37,63 +37,121 @@ export function useStaffNotificationsSocket(
     let disposed = false;
     let socket: WebSocket | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let authTimer: ReturnType<typeof setTimeout> | undefined;
     let attempts = 0;
 
     const connect = () => {
       if (disposed) return;
 
       const token = tokenStore.get();
+
       if (!token) {
+        console.warn('[Staff WS] No authentication token found.');
         setStatus('disconnected');
         return;
       }
 
       setStatus('connecting');
 
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
+    const protocol =
+  window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 
-      socket.onopen = () => {
-        if (disposed || !socket) return;
-        socket.send(JSON.stringify({ type: 'auth', token }));
+const backendHost =
+  window.location.hostname === 'localhost'
+    ? 'localhost:4000'
+    : `${window.location.hostname}:4000`;
+
+const socketUrl = `${protocol}//${backendHost}/ws`;
+
+      console.info('[Staff WS] Connecting:', socketUrl);
+
+      const currentSocket = new WebSocket(socketUrl);
+      socket = currentSocket;
+
+      currentSocket.onopen = () => {
+        if (disposed || currentSocket !== socket) return;
+
+        console.info('[Staff WS] Connection opened. Authenticating...');
+
+        currentSocket.send(
+          JSON.stringify({
+            type: 'auth',
+            token,
+          }),
+        );
+
+        // Do not leave the UI connecting indefinitely.
+        authTimer = setTimeout(() => {
+          if (
+            currentSocket.readyState === WebSocket.OPEN &&
+            !disposed
+          ) {
+            console.error('[Staff WS] Authentication timed out.');
+            currentSocket.close(4000, 'Authentication timeout');
+          }
+        }, 8000);
       };
 
-      socket.onmessage = (event: MessageEvent<string>) => {
+      currentSocket.onmessage = (event: MessageEvent<string>) => {
         let message: SocketMessage;
 
         try {
           message = JSON.parse(event.data) as SocketMessage;
         } catch {
+          console.error('[Staff WS] Invalid server message.');
           return;
         }
 
         if (message.type === 'authenticated') {
+          if (authTimer) clearTimeout(authTimer);
+
           attempts = 0;
           setStatus('connected');
+
+          console.info(
+            '[Staff WS] Authenticated successfully:',
+            message.userId,
+          );
+
           return;
         }
 
         if (message.type === 'staff_notification') {
           callbackRef.current(message.notification);
+          return;
         }
 
         if (message.type === 'error') {
-          console.warn('Staff notification socket:', message.message);
+          console.error('[Staff WS] Server rejected request:', message.message);
         }
       };
 
-      socket.onerror = () => {
-        // onclose handles reconnecting; avoid logging tokens or message contents.
+      currentSocket.onerror = () => {
+        console.error('[Staff WS] WebSocket connection error.');
       };
 
-      socket.onclose = () => {
-        if (disposed) return;
+      currentSocket.onclose = (event: CloseEvent) => {
+        if (authTimer) clearTimeout(authTimer);
+
+        if (disposed || currentSocket !== socket) return;
+
+        console.warn('[Staff WS] Connection closed:', {
+          code: event.code,
+          reason: event.reason,
+          clean: event.wasClean,
+        });
 
         setStatus('disconnected');
+
         attempts += 1;
 
-        // Exponential backoff capped at 30 seconds.
-        const delay = Math.min(1000 * 2 ** Math.min(attempts - 1, 5), 30_000);
+        const delay = Math.min(
+          1000 * 2 ** Math.min(attempts - 1, 5),
+          30_000,
+        );
+
+        console.info(`[Staff WS] Reconnecting in ${delay}ms`);
+
         reconnectTimer = setTimeout(connect, delay);
       };
     };
@@ -102,10 +160,11 @@ export function useStaffNotificationsSocket(
 
     return () => {
       disposed = true;
+
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (authTimer) clearTimeout(authTimer);
 
       if (socket) {
-        // Prevent the close event from starting another connection.
         socket.onclose = null;
         socket.close();
       }

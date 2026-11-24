@@ -15,9 +15,10 @@ export const config = {
   checkoutHour: 12,
   hotelName: process.env.HOTEL_NAME ?? 'Koraf Hotels',
 
-    hotelAddress: process.env.HOTEL_ADDRESS ?? '',
+  hotelAddress: process.env.HOTEL_ADDRESS ?? '',
   hotelPhone: process.env.HOTEL_PHONE ?? '',
   hotelEmail: process.env.HOTEL_EMAIL ?? '',
+  hotelWebsite: process.env.HOTEL_WEBSITE ?? '',
   pdfFontPath: process.env.PDF_FONT_PATH ?? '',
   pdfBoldFontPath: process.env.PDF_BOLD_FONT_PATH ?? '',
   hotelTz: process.env.TZ ?? 'Africa/Lagos',

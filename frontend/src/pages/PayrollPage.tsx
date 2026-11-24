@@ -14,8 +14,8 @@ type Tab = 'runs' | 'staff' | 'settings';
 const KEYS = ['/finance/payroll', '/finance/employees', '/finance/payroll/config'];
 const KIND: Record<string, string> = { PAYE: 'PAYE (state tax office)', PENSION: 'Pension (PFAs)', NHF: 'NHF', LEVIES: 'NSITF and ITF' };
 
-export default function PayrollPage() {
-  const [tab, setTab] = useState<Tab>('runs');
+export default function PayrollPage({ initialTab = 'runs' }: { initialTab?: Tab }) {
+  const [tab, setTab] = useState<Tab>(initialTab);
   return (
     <>
       <PageHeader title="Payroll" subtitle="PAYE, pension and NHF worked out for you. Rates and reliefs are set in Settings." />
